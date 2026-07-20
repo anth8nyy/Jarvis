@@ -2,8 +2,8 @@
 
 An always-on, voice-controlled assistant that lives on your Mac. Say its name,
 give a command, and it acts — opening apps, sending messages, reading your
-calendar and email, playing music, searching the web, and holding a real
-conversation. It answers out loud in a composed, JARVIS-style "sir" persona.
+calendar, playing music, searching the web, and holding a real conversation.
+It answers out loud in a composed, JARVIS-style "sir" persona.
 
 Built to be **fast** (common commands answer instantly, no AI round-trip),
 **private** (speech, brain and voice can all run locally), and **free to run**
@@ -27,8 +27,6 @@ Built to be **fast** (common commands answer instantly, no AI round-trip),
 - **Messages** — send iMessages (fuzzy contact matching, incl. transliteration),
   read recent texts, unsend the last; watches for incoming texts and reads them.
 - **Calls** — place phone/FaceTime calls; accept, reject, hang up.
-- **Email** — watches Gmail (primary inbox only — no promotions/spam) across
-  multiple accounts and announces new mail; read on request.
 - **Music** — play any song/artist on Spotify.
 - **Notes** — create, append to, and delete Apple Notes; search your own notes.
 - **Info** — weather (auto-locates), news headlines, web search, date/time.
@@ -57,7 +55,7 @@ function and list it in `jarvis/tools/__init__.py`. Nothing else changes.
 
 ## Setup
 
-Requires macOS and Python 3.9+.
+Requires **macOS** (Apple Silicon) and **Python 3.9+**.
 
 ```bash
 python3 -m venv .venv
@@ -74,7 +72,6 @@ Optional, all with graceful fallbacks if skipped:
 
 - **Fully local / offline**: install [Ollama](https://ollama.com), `ollama pull
   qwen2.5:7b`, and set `JARVIS_STT_ENGINE=whisper`, `JARVIS_BRAIN=local`.
-- **Gmail**: `./.venv/bin/python -m jarvis.setup_gmail` (uses app passwords).
 - **Always-on app**: a compiled `launcher.c` + a launchd LaunchAgent start it at
   login (edit the hardcoded path in `launcher.c` first).
 
