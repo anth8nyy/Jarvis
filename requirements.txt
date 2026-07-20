@@ -1,0 +1,6 @@
+anthropic>=0.40.0
+python-dotenv>=1.0.1
+requests>=2.31.0
+sounddevice>=0.4.6
+faster-whisper>=1.2.0
+silero-vad>=6.0

@@ -1,0 +1,14 @@
+{
+  "quiet_hours": { "start": "22:00", "end": "08:00" },
+  "heartbeat": {
+    "tick_seconds": 15,
+    "checks": {
+      "due_reminders": { "every_seconds": 30, "enabled": true }
+    }
+  },
+  "confirm_tools": ["delete_task", "forget_fact"],
+  "pricing": {
+    "input_per_mtok": 2.0,
+    "output_per_mtok": 10.0
+  }
+}

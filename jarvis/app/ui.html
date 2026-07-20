@@ -1,0 +1,200 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#0e0e12;
+    font-family:-apple-system, system-ui, sans-serif; }
+  #c, #photo { position:fixed; inset:0; width:100vw; height:100vh; }
+  #c { display:block; }
+  #photo { object-fit:contain; display:none; }
+  #daysleft { position:fixed; top:18px; left:22px; color:#9f86e0; font-size:11px;
+    letter-spacing:.14em; opacity:.85; text-transform:uppercase; line-height:1.4; pointer-events:none; }
+  #daysleft b { display:block; color:#e9deff; font-size:22px; letter-spacing:.02em; }
+  #clock { position:fixed; top:18px; right:22px; text-align:right; color:#9f86e0;
+    font-size:11px; letter-spacing:.14em; opacity:.85; text-transform:uppercase;
+    line-height:1.4; pointer-events:none; }
+  #clock b { display:block; color:#e9deff; font-size:22px; letter-spacing:.02em; }
+  .btn { position:fixed; bottom:30px; padding:10px 22px; border:1px solid rgba(150,120,255,.35);
+    background:rgba(25,18,55,.45); color:#c7b3ff; border-radius:24px; z-index:5;
+    font-size:11px; letter-spacing:.2em; text-transform:uppercase;
+    cursor:pointer; user-select:none; -webkit-user-select:none; transition:all .15s; }
+  .btn:hover { background:rgba(48,34,92,.65); border-color:rgba(185,155,255,.85); }
+  #recBtn { left:24px; }
+  #muteBtn { left:50%; transform:translateX(-50%); }
+  #exportBtn { right:24px; }
+  #muteBtn.active { color:#ff8a7a; border-color:rgba(255,120,100,.8); background:rgba(55,22,22,.5); }
+  #recBtn.recording { color:#7dffa8; border-color:rgba(90,255,150,.7); background:rgba(20,55,30,.5); }
+</style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <img id="photo" src="" />
+  <div id="daysleft"></div>
+  <div id="clock"></div>
+  <div class="btn" id="recBtn">Saving</div>
+  <div class="btn" id="muteBtn">Mute</div>
+  <div class="btn" id="exportBtn">Export</div>
+<script>
+const photo=document.getElementById('photo'), canvasEl=document.getElementById('c');
+let usePhoto=false;
+function tryPhoto(){const img=new Image();
+  img.onload=()=>{usePhoto=true;photo.src=img.src;photo.style.display='block';canvasEl.style.display='none';};
+  img.onerror=()=>{ if(!usePhoto) setTimeout(tryPhoto,4000); };
+  img.src='/sphere.png?'+Date.now();}
+tryPhoto();
+
+// (optional) a countdown widget — set your own date or remove
+const END=new Date(2030,0,1).getTime();
+function updDays(){const d=Math.max(0,Math.ceil((END-Date.now())/86400000));
+  document.getElementById('daysleft').innerHTML=`<b>${d}</b>days left`;}
+updDays(); setInterval(updDays,3600000);
+
+// live real-time clock + date
+const clockEl=document.getElementById('clock');
+function updClock(){const now=new Date();
+  const time=now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  const date=now.toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'});
+  clockEl.innerHTML=`<b>${time}</b>${date}`;}
+updClock(); setInterval(updClock,1000);
+
+const ctx=canvasEl.getContext('2d');
+let W,H,DPR=devicePixelRatio||1;
+function resize(){W=innerWidth;H=innerHeight;canvasEl.width=W*DPR;canvasEl.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}
+addEventListener('resize',resize);resize();
+
+let state='listening',muted=false,t=0,eS=0,spin=0,voice=0;
+const GRID=64;   // dot-grid background spacing (px)
+// A distorted wireframe sphere (blue→magenta) with a particle halo — matching
+// the theme photo — that ripples in time with Jarvis's voice.
+const NLAT=26, NLON=40, TILT=0.42;
+// Particle halo, seeded once.
+const HALO=[]; for(let i=0;i<220;i++){const a=Math.random()*Math.PI*2, rr=0.62+Math.random()*0.55;
+  HALO.push({a, rr, sp:0.2+Math.random()*0.8, ph:Math.random()*6.28, sz:0.5+Math.random()*1.6});}
+
+// Pseudo-noise: smooth, cheap, layered sines → organic lumps that breathe.
+function lump(lat,lon,ph){
+  return Math.sin(lat*3+ph)*Math.cos(lon*2-ph*0.7)
+       + 0.5*Math.sin(lat*5-ph*1.3)*Math.cos(lon*4+ph*0.5)
+       + 0.35*Math.sin((lat+lon)*4+ph*1.7);
+}
+// project a displaced sphere point
+function proj(lat,lon,ang,cx,cy,R,disp){
+  const rr=1+disp;
+  let x=Math.cos(lat)*Math.cos(lon)*rr, y=Math.sin(lat)*rr, z=Math.cos(lat)*Math.sin(lon)*rr;
+  const ca=Math.cos(ang),sa=Math.sin(ang); let x1=x*ca-z*sa, z1=x*sa+z*ca;
+  const ct=Math.cos(TILT),st=Math.sin(TILT); let y2=y*ct-z1*st, z2=y*st+z1*ct;
+  return {x:cx+x1*R, y:cy+y2*R, z:z2};
+}
+
+function draw(){
+  requestAnimationFrame(draw);
+  if(usePhoto){t+=0.03;
+    photo.style.transform=`scale(${(1+(state==='speaking'?0.02:0)*Math.abs(Math.sin(t*5))).toFixed(3)})`;return;}
+
+  let target=state==='speaking'?1.0:state==='thinking'?0.55:state==='listening'?0.34:0.2;
+  if(muted)target=0.1; eS+=(target-eS)*0.09; t+=0.006+eS*0.012;
+  spin += 0.006 + eS*0.012;
+  // "voice": a fast, speech-like flutter that only lives while he speaks, so
+  // the surface jitters like a talking waveform rather than a smooth pulse.
+  const talk = state==='speaking' && !muted ? 1 : 0;
+  const flutter = talk*(0.55+0.45*Math.sin(t*22)+0.3*Math.sin(t*37+1.3));
+  voice += ((talk?flutter:0)-voice)*0.25;
+  const amp = 0;    // TRUE circle — no surface distortion
+
+  ctx.clearRect(0,0,W,H);
+
+  // ---- dot-grid background (behind the sphere) ----
+  const ox=(W%GRID)/2, oy=(H%GRID)/2;
+  ctx.strokeStyle='rgba(140,145,170,0.07)'; ctx.lineWidth=1; ctx.beginPath();
+  for(let x=ox;x<=W;x+=GRID){ctx.moveTo(x,0);ctx.lineTo(x,H);}
+  for(let y=oy;y<=H;y+=GRID){ctx.moveTo(0,y);ctx.lineTo(W,y);}
+  ctx.stroke();
+  ctx.fillStyle='rgba(210,215,240,0.34)';
+  for(let x=ox;x<=W;x+=GRID)for(let y=oy;y<=H;y+=GRID)ctx.fillRect(x-1,y-1,2,2);
+
+  const cx=W/2, cy=H/2, ang=spin, ph=t*1.4;
+  // The whole sphere breathes with his voice instead of getting lumpy — stays
+  // a perfect circle, just gently pulsing bigger when he speaks. (Smaller now.)
+  const R=Math.min(W,H)*0.24*(1 + eS*0.04 + Math.max(0,voice)*0.05);
+
+  // ambient glow behind the blob
+  const bg=ctx.createRadialGradient(cx-R*0.3,cy-R*0.3,0,cx,cy,R*1.7);
+  bg.addColorStop(0,`rgba(70,120,255,${0.16+eS*0.18})`);
+  bg.addColorStop(0.45,`rgba(150,60,235,${0.10+eS*0.12})`);
+  bg.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=bg; ctx.fillRect(0,0,W,H);
+
+  // colour by screen position: blue top-left → magenta bottom-right (the photo)
+  function col(px,py,a){
+    const u=((px-cx)/R+(py-cy)/R+2)/4;               // 0=top-left .. 1=bottom-right
+    const r=Math.round(70+u*200), g=Math.round(150-u*120), b=Math.round(255-u*30);
+    return `rgba(${r},${g},${b},${a})`;
+  }
+  ctx.globalCompositeOperation='lighter';
+  ctx.shadowColor='rgba(150,90,255,0.7)';
+
+  // precompute displaced grid
+  const P=[];
+  for(let i=0;i<=NLAT;i++){const lat=-Math.PI/2+Math.PI*(i/NLAT); const row=[];
+    for(let j=0;j<=NLON;j++){const lon=(j/NLON)*Math.PI*2;
+      const d=amp*lump(lat,lon,ph);
+      row.push(proj(lat,lon,ang,cx,cy,R,d));}
+    P.push(row);}
+
+  // parallels (latitude rings)
+  for(let i=1;i<NLAT;i++){ctx.beginPath();
+    for(let j=0;j<=NLON;j++){const p=P[i][j]; j===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y);}
+    const front=P[i][0].z>0; ctx.lineWidth=front?0.9:0.5;
+    ctx.shadowBlur=(front?7:2)+eS*20; ctx.strokeStyle=col(P[i][0].x,P[i][0].y,(0.10+0.4*Math.abs(Math.cos(-Math.PI/2+Math.PI*i/NLAT)))*(0.55+eS*0.7));
+    ctx.stroke();}
+  // meridians (longitude lines)
+  for(let j=0;j<NLON;j+=1){const facing=Math.sin((j/NLON)*Math.PI*2+ang);
+    ctx.beginPath();
+    for(let i=0;i<=NLAT;i++){const p=P[i][j]; i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y);}
+    ctx.lineWidth=facing>0?0.85:0.45; ctx.shadowBlur=(facing>0?7:2)+eS*20;
+    ctx.strokeStyle=col(P[0][j].x,P[0][j].y,(0.09+0.42*Math.max(0,facing))*(0.55+eS*0.7));
+    ctx.stroke();}
+  // bright node dots on the front
+  ctx.shadowBlur=6;
+  for(let i=2;i<NLAT;i+=2)for(let j=0;j<NLON;j+=2){const p=P[i][j]; if(p.z<=0)continue;
+    ctx.fillStyle=col(p.x,p.y,(0.25+0.55*p.z)*(0.5+eS)); const s=0.7+p.z*1.5; ctx.fillRect(p.x,p.y,s,s);}
+
+  // particle halo drifting around the blob (reacts too)
+  for(const q of HALO){const a=q.a+ang*0.4+t*0.05*q.sp;
+    const rad=R*(q.rr+0.05*Math.sin(t*q.sp*2+q.ph)+voice*0.12);
+    const px=cx+Math.cos(a)*rad, py=cy+Math.sin(a)*rad*0.9;
+    ctx.fillStyle=col(px,py,0.35+0.4*Math.sin(t*q.sp*3+q.ph)*(0.5+eS));
+    const s=q.sz*(0.8+eS*0.7); ctx.fillRect(px,py,s,s);}
+
+  ctx.globalCompositeOperation='source-over'; ctx.globalAlpha=1; ctx.shadowBlur=0;
+}
+draw();
+
+// keep polling engine state so the sphere reacts + buttons reflect state
+const muteBtn=document.getElementById('muteBtn'), recBtn=document.getElementById('recBtn'),
+      exportBtn=document.getElementById('exportBtn');
+let recording=false, exporting=false;
+async function poll(){try{const s=await(await fetch('/state',{cache:'no-store'})).json();
+  state=s.state;muted=s.muted;recording=s.recording;
+  muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+  muteBtn.classList.toggle('active',muted);
+  recBtn.classList.toggle('recording',recording);   // green while saving, like mute goes red
+}catch(e){}}
+setInterval(poll,200);
+// mute/unmute toggle
+muteBtn.addEventListener('click',async()=>{try{await fetch('/togglemute',{method:'POST'});poll();}catch(e){}});
+// start a fresh recording
+recBtn.addEventListener('click',async()=>{try{await fetch('/startsave',{method:'POST'});poll();}catch(e){}});
+// export the recorded chat to Word
+exportBtn.addEventListener('click',async()=>{
+  if(exporting)return; exporting=true;
+  const orig=exportBtn.textContent; exportBtn.textContent='Saving…';
+  try{ const r=await(await fetch('/export',{method:'POST'})).json();
+       exportBtn.textContent = r.ok ? 'Saved!' : 'Failed'; }
+  catch(e){ exportBtn.textContent='Failed'; }
+  setTimeout(()=>{exportBtn.textContent=orig; exporting=false; poll();},1800);
+});
+</script>
+</body>
+</html>
