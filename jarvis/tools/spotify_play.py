@@ -52,6 +52,56 @@ def _ensure_device(sp) -> str:
     return active["id"]
 
 
+def _play_uris_in_app(uris: list) -> bool:
+    """Play track URIs through the DESKTOP Spotify app via AppleScript.
+
+    Far more reliable than the Web API's start_playback, which fails with "no
+    active device" whenever Spotify is closed or idle — exactly when the user
+    asks. This opens Spotify if needed, waits for it to become drivable, then
+    plays, verifying the playhead actually advances (a cold app accepts the
+    command then stalls). Queueing multiple URIs isn't scriptable, so we play
+    the first and rely on the user's context/radio for the rest.
+    """
+    import subprocess
+    import time
+
+    def sh(cmd):
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+
+    def osa(script):
+        r = sh(["osascript", "-e", script])
+        return (r.stdout or "").strip() if r.returncode == 0 else ""
+
+    if not uris:
+        return False
+    cold = subprocess.run(["pgrep", "-x", "Spotify"], capture_output=True).returncode != 0
+    if cold:
+        subprocess.run(["open", "-a", "Spotify"], capture_output=True)
+    # Wait until it can be driven (answers with a readable player position).
+    t0 = time.time()
+    while time.time() - t0 < 15:
+        if "|" in osa('tell application "Spotify" to (player state as string) & "|" & (player position as string)'):
+            break
+        time.sleep(0.5)
+    if cold:
+        time.sleep(2.0)   # a freshly launched Spotify isn't playable instantly
+    uri = uris[0]
+    for i in range(8):
+        sh(["osascript", "-e", f'tell application "Spotify" to play track "{uri}"'])
+        time.sleep(0.6)
+        if osa('tell application "Spotify" to player state as string') == "playing":
+            try:
+                p1 = float(osa('tell application "Spotify" to player position') or 0)
+                time.sleep(0.4)
+                p2 = float(osa('tell application "Spotify" to player position') or 0)
+                if p2 >= p1:
+                    return True
+            except ValueError:
+                pass
+        time.sleep(min(0.5 * (i + 1), 2.5))
+    return False
+
+
 def play_song(query: str) -> str:
     """Search for a track and start playing it."""
     sp = _spotify()
@@ -62,9 +112,9 @@ def play_song(query: str) -> str:
     if not items:
         return f"Couldn't find a song matching '{query}' on Spotify."
     track = items[0]
-    device_id = _ensure_device(sp)
-    sp.start_playback(device_id=device_id, uris=[track["uri"]])
     artists = ", ".join(a["name"] for a in track["artists"])
+    if not _play_uris_in_app([track["uri"]]):
+        return f"I found “{track['name']}” but Spotify wouldn't play it, sir."
     return f"Playing “{track['name']}” by {artists}."
 
 
@@ -124,9 +174,9 @@ def play_artist(artist: str) -> str:
     if not uris:
         return f"No tracks found for {name}, sir."
     random.shuffle(uris)
-    device_id = _ensure_device(sp)
-    sp.start_playback(device_id=device_id, uris=uris)
-    return f"Playing some {name} on shuffle, sir."
+    if not _play_uris_in_app(uris):
+        return f"I found {name} but Spotify wouldn't play, sir."
+    return f"Playing some {name}, sir."
 
 
 def register(registry: Registry) -> None:
