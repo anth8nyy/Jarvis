@@ -163,6 +163,7 @@ _TOOL_HINTS = {
     "reschedule_calendar_event": ["move", "reschedule", "change"],
     "play_song": ["play", "song", "track", "music"],
     "play_artist": ["play", "artist", "band", "some"],
+    "play_playlist": ["playlist", "my playlist", "put on my"],
     "spotify": ["pause", "resume", "next", "skip", "previous", "spotify"],
     "open_app": ["open", "launch", "start"],
     "close_app": ["close", "quit"],

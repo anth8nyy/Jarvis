@@ -529,6 +529,20 @@ class JarvisEngine:
             self._say(close_app(app))   # honest: says if it wasn't even open
             return True
 
+        # "play my <name> playlist" / "play the <name> playlist" — a named
+        # library playlist, not a song. Must beat _PLAY_RE.
+        mpl = re.match(r"^(?:play|put on)\s+(?:my|the)?\s*(.+?)\s+playlist\b", c, re.IGNORECASE)
+        if mpl or ("playlist" in low and re.match(r"^(?:play|put on)\b", low)):
+            from jarvis.tools.spotify_play import play_playlist
+            name = mpl.group(1) if mpl else re.sub(
+                r"^(?:play|put on)\s+(?:my|the)?\s*|\s*playlist\b", "", c, flags=re.IGNORECASE).strip()
+            self._set("thinking")
+            try:
+                self._say(play_playlist(name))
+            except Exception:
+                self._say("I couldn't play that playlist, sir.")
+            return True
+
         m = _ARTIST_RE.match(c)   # "play some <artist>" — check before plain play
         if m:
             self._set("thinking")

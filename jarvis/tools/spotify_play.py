@@ -36,7 +36,8 @@ def _spotify():
         client_id=config.SPOTIFY_CLIENT_ID,
         client_secret=config.SPOTIFY_CLIENT_SECRET,
         redirect_uri=config.SPOTIFY_REDIRECT_URI,
-        scope="user-modify-playback-state user-read-playback-state",
+        scope=("user-modify-playback-state user-read-playback-state "
+               "playlist-read-private playlist-read-collaborative"),
         cache_path=_CACHE,
         open_browser=True,
     )
@@ -107,11 +108,24 @@ def play_song(query: str) -> str:
     sp = _spotify()
     # limit=5, not 1: a limit of 1 returns an unreliable result from these
     # credentials. The wider search's first hit is correctly relevance-ranked.
-    results = sp.search(q=query, type="track", limit=5)
+    results = sp.search(q=query, type="track", limit=10)
     items = results.get("tracks", {}).get("items", [])
     if not items:
         return f"Couldn't find a song matching '{query}' on Spotify."
-    track = items[0]
+    # The top hit is often a karaoke/cover/sped-up version. Among the closest
+    # title matches, prefer the most POPULAR (the canonical original).
+    import difflib
+
+    q = query.lower()
+    def score(t):
+        title = t["name"].lower()
+        artist = " ".join(a["name"] for a in t["artists"]).lower()
+        rel = difflib.SequenceMatcher(None, q, f"{title} {artist}").ratio()
+        rel = max(rel, difflib.SequenceMatcher(None, q, title).ratio())
+        junk = any(w in title for w in ("karaoke", "cover", "tribute", "sped up",
+                                        "8d", "instrumental", "made famous"))
+        return (0 if junk else 1, round(rel, 2), t.get("popularity", 0))
+    track = max(items, key=score)
     artists = ", ".join(a["name"] for a in track["artists"])
     if not _play_uris_in_app([track["uri"]]):
         return f"I found “{track['name']}” but Spotify wouldn't play it, sir."
@@ -179,7 +193,60 @@ def play_artist(artist: str) -> str:
     return f"Playing some {name}, sir."
 
 
+def play_playlist(name: str) -> str:
+    """Find one of the user's own playlists by name and play it."""
+    import difflib
+
+    sp = _spotify()
+    try:
+        pls, offset = [], 0
+        while True:
+            page = sp.current_user_playlists(limit=50, offset=offset)
+            items = page.get("items", [])
+            pls.extend(items)
+            if len(items) < 50:
+                break
+            offset += 50
+    except Exception:
+        return ("I couldn't read your playlists, sir — you may need to re-approve "
+                "Spotify access.")
+    if not pls:
+        return "You don't have any playlists I can see, sir."
+    want = name.strip().lower()
+    best, score = None, 0.0
+    for p in pls:
+        pn = (p.get("name") or "").lower()
+        s = difflib.SequenceMatcher(None, want, pn).ratio()
+        if want and (want in pn or pn.startswith(want)):
+            s = max(s, 0.95)
+        if s > score:
+            best, score = p, s
+    if best is None or score < 0.5:
+        return f"I couldn't find a playlist called '{name}', sir."
+    if not _play_uris_in_app([best["uri"]]):
+        return f"I found your '{best['name']}' playlist but Spotify wouldn't play it, sir."
+    return f"Playing your {best['name']} playlist, sir."
+
+
 def register(registry: Registry) -> None:
+    registry.register(
+        Tool(
+            name="play_playlist",
+            description=(
+                "Play one of the USER'S OWN Spotify playlists by name (from their "
+                "library). Use for 'play my <name> playlist', 'put on my <name>', "
+                "'play my liked/workout/chill playlist'. Fuzzy-matches the name."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The playlist's name."}
+                },
+                "required": ["name"],
+            },
+            handler=play_playlist,
+        )
+    )
     registry.register(
         Tool(
             name="play_song",
