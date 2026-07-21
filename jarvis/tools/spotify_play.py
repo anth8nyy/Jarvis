@@ -88,8 +88,15 @@ def _play_uris_in_app(uris: list) -> bool:
         time.sleep(2.0)   # a freshly launched Spotify isn't playable instantly
     uri = uris[0]
     for i in range(8):
-        sh(["osascript", "-e", f'tell application "Spotify" to play track "{uri}"'])
+        # `play track <uri>` loads the track/playlist context — but for a
+        # PLAYLIST it often just navigates there without starting. The bare
+        # `play` right after is what actually begins playback.
+        sh(["osascript", "-e",
+            f'tell application "Spotify"\nplay track "{uri}"\ndelay 0.4\nplay\nend tell'])
         time.sleep(0.6)
+        if osa('tell application "Spotify" to player state as string') != "playing":
+            sh(["osascript", "-e", 'tell application "Spotify" to play'])
+            time.sleep(0.5)
         if osa('tell application "Spotify" to player state as string') == "playing":
             try:
                 p1 = float(osa('tell application "Spotify" to player position') or 0)
