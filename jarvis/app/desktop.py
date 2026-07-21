@@ -223,6 +223,25 @@ class JarvisEngine:
     def _set(self, s: str) -> None:
         STATE["state"] = s
 
+    @staticmethod
+    def _says_own_name(text: str) -> bool:
+        """Would speaking this text make him hear his OWN wake word? Reading a
+        message like "Jarvis εισαι καλος" aloud used to wake him mid-sentence,
+        so he answered himself with "At your service, sir"."""
+        return "jarvis" in (text or "").lower().replace(" ", "")
+
+    def _speak_safely(self, text: str, voice=None) -> None:
+        """Speak, deafening the wake listener if the words contain his name so
+        he can't self-trigger. Normal speech keeps the mic open for barge-in."""
+        guard = self._says_own_name(text)
+        if guard:
+            self.wake.pause()
+        try:
+            self.speaker.speak(text, voice=voice) if voice else self.speaker.speak(text)
+        finally:
+            if guard and not STATE["muted"]:
+                self.wake.resume()
+
     def _say(self, text: str) -> None:
         """Speak — closing the mic ONLY while actually talking, so Jarvis stays
         deaf for the shortest possible time (not through his whole 'thinking')."""
@@ -232,7 +251,7 @@ class JarvisEngine:
             transcript.log("Jarvis", text)
         self._set("speaking")
         try:
-            self.speaker.speak(text)   # mic stays open → you can say "Jarvis" to cut in
+            self._speak_safely(text)   # mic stays open (unless he says his own name)
         finally:
             self._set("muted" if STATE["muted"] else "listening")
 
@@ -822,12 +841,14 @@ class JarvisEngine:
             self._cancel.clear()
             if STATE["recording"]:
                 transcript.log(sender, body)
-            self._hold_music(True)    # pause the music so the message is clear
+            self._hold_music(True)    # duck the music so the message is clear
             self._set("speaking")
             try:
-                self.speaker.speak(f"Sir, a message from {sender}.")
+                self._speak_safely(f"Sir, a message from {sender}.")
                 if not self._cancel.is_set():
-                    self.speaker.speak(body, voice=body_voice)
+                    # The message text is arbitrary — if it contains "Jarvis",
+                    # _speak_safely deafens him so he doesn't answer himself.
+                    self._speak_safely(body, voice=body_voice)
             finally:
                 self._hold_music(False)   # …and pick the song back up
                 self._set("muted" if STATE["muted"] else "listening")
