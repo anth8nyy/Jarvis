@@ -275,11 +275,46 @@ class JarvisEngine:
         self.set_muted(not STATE["muted"])
 
     # --- a full spoken turn ----------------------------------------------
+    _DUCK_TO = 20        # music volume (%) while he's listening/talking
+    _duck_prev = None    # the level to put back afterwards
+
+    def _duck_music(self, on: bool) -> None:
+        """Drop Spotify's own volume while Jarvis listens/speaks, then restore —
+        so you can talk to him over music and hear his reply. Spotify has its
+        OWN volume, so this never quietens his voice."""
+        import subprocess
+
+        def osa(script, timeout=4):
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=timeout)
+            return (r.stdout or "").strip() if r.returncode == 0 else ""
+
+        try:
+            if subprocess.run(["pgrep", "-x", "Spotify"], capture_output=True).returncode != 0:
+                return                      # not running — nothing to duck
+            if on:
+                if self._duck_prev is not None:
+                    return                  # already ducked
+                if osa('tell application "Spotify" to player state as string') != "playing":
+                    return                  # nothing playing — leave it alone
+                cur = osa('tell application "Spotify" to sound volume')
+                self._duck_prev = int(cur) if cur.isdigit() else None
+                if self._duck_prev is not None and self._duck_prev > self._DUCK_TO:
+                    osa(f'tell application "Spotify" to set sound volume to {self._DUCK_TO}')
+                else:
+                    self._duck_prev = None  # already quiet; don't touch it
+            elif self._duck_prev is not None:
+                osa(f'tell application "Spotify" to set sound volume to {self._duck_prev}')
+                self._duck_prev = None
+        except Exception:
+            self._duck_prev = None
+
     def _on_wake(self, wav: bytes) -> None:
         # Barge-in already stopped the old speech via _interrupt; wait (briefly)
         # for the previous turn to release, then take over.
         if not self._busy.acquire(timeout=8):
             return
+        self._duck_music(True)   # quieten the music for the whole exchange
         try:
             self._cancel.clear()
             self.speaker.stop()
@@ -310,6 +345,7 @@ class JarvisEngine:
             if not self._cancel.is_set():
                 self._followup_loop()
         finally:
+            self._duck_music(False)   # turn the music back up
             if not STATE["muted"]:
                 self._set("listening")
             self._busy.release()
