@@ -275,13 +275,14 @@ class JarvisEngine:
         self.set_muted(not STATE["muted"])
 
     # --- a full spoken turn ----------------------------------------------
-    _DUCK_TO = 20        # music volume (%) while he's listening/talking
-    _duck_prev = None    # the level to put back afterwards
+    _DUCK_TO = 20        # music volume (%) while a message is read out
+    _duck_prev = None    # the exact level to put back afterwards
 
-    def _duck_music(self, on: bool) -> None:
-        """Drop Spotify's own volume while Jarvis listens/speaks, then restore —
-        so you can talk to him over music and hear his reply. Spotify has its
-        OWN volume, so this never quietens his voice."""
+    def _hold_music(self, on: bool) -> None:
+        """Drop Spotify to 20% while a message is read aloud, then restore it to
+        EXACTLY the level it was at. Used only for unprompted announcements —
+        normal conversation never touches the music. Spotify has its own volume,
+        so his voice stays at full loudness."""
         import subprocess
 
         def osa(script, timeout=4):
@@ -298,11 +299,10 @@ class JarvisEngine:
                 if osa('tell application "Spotify" to player state as string') != "playing":
                     return                  # nothing playing — leave it alone
                 cur = osa('tell application "Spotify" to sound volume')
-                self._duck_prev = int(cur) if cur.isdigit() else None
-                if self._duck_prev is not None and self._duck_prev > self._DUCK_TO:
+                prev = int(cur) if cur.isdigit() else None
+                if prev is not None and prev > self._DUCK_TO:
                     osa(f'tell application "Spotify" to set sound volume to {self._DUCK_TO}')
-                else:
-                    self._duck_prev = None  # already quiet; don't touch it
+                    self._duck_prev = prev
             elif self._duck_prev is not None:
                 osa(f'tell application "Spotify" to set sound volume to {self._duck_prev}')
                 self._duck_prev = None
@@ -314,7 +314,6 @@ class JarvisEngine:
         # for the previous turn to release, then take over.
         if not self._busy.acquire(timeout=8):
             return
-        self._duck_music(True)   # quieten the music for the whole exchange
         try:
             self._cancel.clear()
             self.speaker.stop()
@@ -345,7 +344,6 @@ class JarvisEngine:
             if not self._cancel.is_set():
                 self._followup_loop()
         finally:
-            self._duck_music(False)   # turn the music back up
             if not STATE["muted"]:
                 self._set("listening")
             self._busy.release()
@@ -824,12 +822,14 @@ class JarvisEngine:
             self._cancel.clear()
             if STATE["recording"]:
                 transcript.log(sender, body)
+            self._hold_music(True)    # pause the music so the message is clear
             self._set("speaking")
             try:
                 self.speaker.speak(f"Sir, a message from {sender}.")
                 if not self._cancel.is_set():
                     self.speaker.speak(body, voice=body_voice)
             finally:
+                self._hold_music(False)   # …and pick the song back up
                 self._set("muted" if STATE["muted"] else "listening")
             return True
         finally:
@@ -839,9 +839,13 @@ class JarvisEngine:
         """A new primary-inbox email arrived — say which account and who from."""
         if STATE["recording"]:
             transcript.log("Email", f"[{account}] from {sender}: {subject}")
-        return self._announce(
-            f"Sir, a new email on your {account} account, from {sender}."
-        )
+        self._hold_music(True)     # quieten the music for the announcement
+        try:
+            return self._announce(
+                f"Sir, a new email on your {account} account, from {sender}."
+            )
+        finally:
+            self._hold_music(False)
 
     def _fda_notice(self) -> None:
         # Keep trying until he's free to say it — it's actionable information.
