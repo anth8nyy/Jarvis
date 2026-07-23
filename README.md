@@ -1,5 +1,8 @@
 # JARVIS — a voice-first AI assistant for macOS
 
+
+# JARVIS IS NOT READY YET
+
 An always-on, voice-controlled assistant that lives on your Mac. Say its name,
 give a command, and it acts — opening apps, sending messages, reading your
 calendar, playing music, searching the web, and holding a real conversation.
