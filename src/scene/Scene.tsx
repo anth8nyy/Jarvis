@@ -1,5 +1,5 @@
-import { useMemo } from 'react'
-import { Canvas, useFrame } from '@react-three/fiber'
+import { useEffect, useMemo, useSyncExternalStore } from 'react'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import {
   EffectComposer,
   Bloom,
@@ -13,6 +13,7 @@ import { Core } from './Core'
 import { Particles } from './Particles'
 import { Orbits } from './Orbits'
 import { useStore, phaseColor, accentFor, type Phase } from '../store'
+import { isLite, onLite } from '../lib/perf'
 
 /** Rings spin harder while JARVIS is working — reads as effort. */
 const spinFor: Record<Phase, number> = {
@@ -107,6 +108,7 @@ function aim(tint: Tint, css: string): THREE.Color {
 const STYLE_INDEX = { ring: 0, sphere: 1, wire: 2 } as const
 
 function Rig() {
+  const lite = useSyncExternalStore(onLite, isLite)
   const drive = useMemo<Drive>(
     () => ({
       color: new THREE.Color(phaseColor.offline),
@@ -186,20 +188,51 @@ function Rig() {
   return (
     <>
       <Core drive={drive} />
-      <Particles drive={drive} />
+      <Particles drive={drive} count={lite ? 1500 : undefined} />
       <Orbits />
     </>
   )
 }
 
+/**
+ * Light mode's frame rate: 30 while he waits, 60 when he is listening, thinking
+ * or talking — the moments the motion means something. Drives the canvas,
+ * which is on demand in light mode.
+ */
+function FrameLimiter() {
+  const invalidate = useThree((s) => s.invalidate)
+  useEffect(() => {
+    let raf = 0
+    let last = 0
+    const tick = (t: number) => {
+      raf = requestAnimationFrame(tick)
+      const { phase } = useStore.getState()
+      const fps = phase === 'dormant' || phase === 'offline' ? 30 : 60
+      if (t - last >= 1000 / fps - 2) {
+        last = t
+        invalidate()
+      }
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [invalidate])
+  return null
+}
+
 export function Scene() {
+  const lite = useSyncExternalStore(onLite, isLite)
   return (
     <Canvas
+      // Remounted on a switch: resolution and antialiasing are fixed at creation.
+      key={lite ? 'lite' : 'full'}
       className="scene"
       camera={{ position: [0, 0, 6.2], fov: 45 }}
-      gl={{ antialias: true, alpha: true }}
-      dpr={[1, 2]}
+      gl={{ antialias: !lite, alpha: true, powerPreference: lite ? 'low-power' : 'high-performance' }}
+      // Light: normal resolution — a quarter of the pixels of Retina.
+      dpr={lite ? 1 : [1, 2]}
+      frameloop={lite ? 'demand' : 'always'}
     >
+      {lite && <FrameLimiter />}
       <Rig />
       {/*
         multisampling={0} on purpose. The default is 8, which allocates a
@@ -227,13 +260,21 @@ export function Scene() {
           mipmapBlur
           radius={0.72}
         />
-        <ChromaticAberration
-          offset={new THREE.Vector2(0.0009, 0.0012)}
-          radialModulation={false}
-          modulationOffset={0}
-        />
-        <Noise opacity={0.035} blendFunction={BlendFunction.OVERLAY} />
-        <Vignette eskil={false} offset={0.22} darkness={0.95} />
+        {/* The fine film effects cost a pass over every pixel each frame and
+            are barely visible; light mode keeps the glow and drops them. */}
+        {lite ? (
+          <Vignette eskil={false} offset={0.22} darkness={0.95} />
+        ) : (
+          <>
+            <ChromaticAberration
+              offset={new THREE.Vector2(0.0009, 0.0012)}
+              radialModulation={false}
+              modulationOffset={0}
+            />
+            <Noise opacity={0.035} blendFunction={BlendFunction.OVERLAY} />
+            <Vignette eskil={false} offset={0.22} darkness={0.95} />
+          </>
+        )}
       </EffectComposer>
     </Canvas>
   )

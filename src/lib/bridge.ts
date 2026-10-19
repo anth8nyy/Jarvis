@@ -490,6 +490,23 @@ export function cancel(): void {
   pending?.finish()
 }
 
+/**
+ * Ask the bridge to close JARVIS — "goodbye", "goodnight". It quits this
+ * window's own Chrome instance, and the launcher then stops the servers.
+ */
+export function goodbye(): void {
+  if (socket?.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'goodbye' }))
+  }
+}
+
+/** Note, in the bridge log, a short phrase that was not taken as his name. */
+export function reportHeard(text: string): void {
+  if (socket?.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'heard', text: text.slice(0, 120) }))
+  }
+}
+
 /** The older name for `cancel()`. */
 export function interrupt(): void {
   cancel()

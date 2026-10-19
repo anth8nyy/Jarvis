@@ -1,10 +1,14 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useStore, type Blade } from '../store'
 import { BRIDGE_HTTP_URL } from '../config'
 import { sanitisePanelHtml } from './sanitise'
 import { frameSpan, peaceScroll, pinchCount } from '../lib/hands'
 import * as camera from '../lib/camera'
+import * as sfx from '../lib/sfx'
+import { createSpeaker } from '../lib/tts'
+import { isGreek } from '../lib/lang'
 
 /**
  * The blades.
@@ -157,8 +161,150 @@ const CameraView = memo(function CameraView() {
   return <video ref={el} className="bl-camera" autoPlay playsInline muted />
 })
 
+/**
+ * A live countdown. Counts from the bridge's clock (same machine), so a reload
+ * or a slow tab never drifts it — it always shows the real time left. At zero
+ * it flashes, chimes and says so, once.
+ */
+/** Spoken reminders after a countdown ends, until acknowledged. */
+const REMIND_EVERY_MS = 30_000
+const REMINDERS = 5
+
+function TimerView({ blade }: { blade: Blade }) {
+  const endsAt = blade.endsAt ?? Date.now()
+  const total = Math.max(1, blade.durationMs ?? 1)
+  const [now, setNow] = useState(() => Date.now())
+  const announced = useRef(false)
+  const left = Math.max(0, endsAt - now)
+  const done = left === 0
+
+  useEffect(() => {
+    if (done) return
+    const t = setInterval(() => setNow(Date.now()), 250)
+    return () => clearInterval(t)
+  }, [done])
+
+  /**
+   * Say it out loud — and keep saying it. Once is easy to miss from across the
+   * room, so the reminder repeats every REMIND_EVERY_MS until it is
+   * acknowledged (a click on the panel, or closing it), up to REMINDERS times.
+   */
+  const [acknowledged, setAcknowledged] = useState(false)
+  useEffect(() => {
+    if (!done || acknowledged) return
+    // A countdown that ended long ago (say, before a reload) is not news.
+    if (Date.now() - endsAt > 60_000) return
+    const label = blade.title && blade.title !== 'COUNTDOWN' ? `the ${blade.title.toLowerCase()} countdown` : 'your countdown'
+    let said = 0
+    const remind = () => {
+      if (said >= REMINDERS) return
+      sfx.play('done')
+      const spk = createSpeaker()
+      spk.say(said === 0 ? `Sir, ${label} is complete.` : `Sir, a reminder: ${label} has finished.`)
+      void spk.end()
+      said++
+    }
+    if (!announced.current) {
+      announced.current = true
+      remind()
+    }
+    const t = setInterval(remind, REMIND_EVERY_MS)
+    return () => clearInterval(t)
+  }, [done, acknowledged, endsAt, blade.title])
+
+  const secs = Math.ceil(left / 1000)
+  const h = Math.floor(secs / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  const sec = secs % 60
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const shown = h ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`
+
+  return (
+    <div
+      className={`bl-timer${done ? ' is-done' : ''}${acknowledged ? ' is-acked' : ''}`}
+      onPointerDown={() => done && setAcknowledged(true)}
+    >
+      <div className="bl-timer-time">{done ? 'TIME’S UP' : shown}</div>
+      <div className="bl-timer-bar">
+        <div className="bl-timer-fill" style={{ width: `${(left / total) * 100}%` }} />
+      </div>
+      {done && !acknowledged && <div className="bl-timer-hint">click to stop the reminder</div>}
+    </div>
+  )
+}
+
+/** Ticks: re-renders the caller every `ms` with the current time. */
+function useNow(ms: number): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), ms)
+    return () => clearInterval(t)
+  }, [ms])
+  return now
+}
+
+/**
+ * A live clock — "what time is it" used to put up a picture of the time that
+ * then sat there going stale. This keeps ticking, here or in another zone.
+ */
+function ClockView({ blade }: { blade: Blade }) {
+  const now = useNow(1000)
+  const locale = isGreek() ? 'el-GR' : 'en-GB'
+  const zone = blade.timeZone ? { timeZone: blade.timeZone } : {}
+  const time = new Date(now).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, ...zone })
+  const date = new Date(now).toLocaleDateString(locale, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', ...zone })
+  const tzName =
+    new Intl.DateTimeFormat(locale, { timeZoneName: 'short', ...zone })
+      .formatToParts(now)
+      .find((p) => p.type === 'timeZoneName')?.value ?? ''
+  return (
+    <div className="bl-timer bl-clock">
+      <div className="bl-timer-time">{time}</div>
+      <div className="bl-clock-date">
+        {date}
+        {tzName ? ` — ${tzName}` : ''}
+      </div>
+    </div>
+  )
+}
+
+/** A stopwatch counting up from when it was started; click to pause/resume. */
+function StopwatchView({ blade }: { blade: Blade }) {
+  const [paused, setPaused] = useState<number | null>(null) // elapsed ms when paused
+  const [offset, setOffset] = useState(0) // time spent paused, so resume continues
+  const now = useNow(paused === null ? 100 : 60_000)
+  const start = blade.startedAt ?? now
+  const elapsed = paused ?? Math.max(0, now - start - offset)
+  const toggle = () => {
+    if (paused === null) setPaused(elapsed)
+    else {
+      setOffset(Date.now() - start - paused)
+      setPaused(null)
+    }
+  }
+  const total = Math.floor(elapsed / 100)
+  const tenths = total % 10
+  const secs = Math.floor(total / 10) % 60
+  const mins = Math.floor(total / 600) % 60
+  const hrs = Math.floor(total / 36000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return (
+    <div className={`bl-timer${paused !== null ? ' is-acked' : ''}`} onPointerDown={toggle} style={{ cursor: 'pointer' }}>
+      <div className="bl-timer-time">
+        {hrs ? `${hrs}:` : ''}
+        {pad(mins)}:{pad(secs)}
+        <span className="bl-stopwatch-tenths">.{tenths}</span>
+      </div>
+      <div className="bl-timer-hint">{paused !== null ? 'paused — click to resume' : 'click to pause'}</div>
+    </div>
+  )
+}
+
 const Body = memo(function Body({ blade }: { blade: Blade }) {
   if (blade.kind === 'camera') return <CameraView />
+  if (blade.kind === 'timer') return <TimerView blade={blade} />
+  if (blade.kind === 'clock') return <ClockView blade={blade} />
+  if (blade.kind === 'stopwatch') return <StopwatchView blade={blade} />
 
   if (blade.kind === 'article' && blade.url) {
     return (
@@ -237,6 +383,15 @@ const Body = memo(function Body({ blade }: { blade: Blade }) {
 
 /* -------------------------------------------------------------------- card */
 
+/** Release speed is measured over this much of the end of a drag. */
+const THROW_WINDOW_MS = 110
+/** Slower than this (px/ms) on release is a placement, not a throw. */
+const THROW_MIN_SPEED = 0.35
+/** Fraction of speed kept per 16ms frame while gliding. */
+const THROW_FRICTION = 0.93
+/** Once this much of a thrown blade is off-screen, it is dismissed. */
+const THROW_AWAY_FRACTION = 0.6
+
 function Card({
   blade,
   depth,
@@ -299,17 +454,24 @@ function Card({
   const grab = (
     e: React.PointerEvent,
     onMove: (dx: number, dy: number) => void,
+    onRelease?: (vx: number, vy: number) => void,
   ) => {
     e.preventDefault()
     e.stopPropagation()
+    stopFling()
     const sx = e.clientX
     const sy = e.clientY
     let baseX = sx
     let baseY = sy
     let dx = 0
     let dy = 0
+    /** Recent positions, for the speed at the moment of release. */
+    const samples: { x: number; y: number; at: number }[] = []
 
     const move = (ev: PointerEvent) => {
+      const now = performance.now()
+      samples.push({ x: ev.clientX, y: ev.clientY, at: now })
+      while (samples.length > 2 && now - samples[0].at > THROW_WINDOW_MS) samples.shift()
       /**
        * Both hands pinching means this is not a drag.
        *
@@ -333,14 +495,68 @@ function Card({
       dy = ev.clientY - baseY
       onMove(dx, dy)
     }
-    const done = () => {
+    const done = (ev: PointerEvent) => {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', done)
       window.removeEventListener('pointercancel', done)
+      if (!onRelease || ev.type !== 'pointerup' || samples.length < 2) return
+      // A hand that has stopped before letting go is placing, not throwing.
+      const last = samples[samples.length - 1]
+      if (performance.now() - last.at > THROW_WINDOW_MS) return
+      const first = samples[0]
+      const dt = Math.max(16, last.at - first.at)
+      onRelease((last.x - first.x) / dt, (last.y - first.y) / dt)
     }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', done)
     window.addEventListener('pointercancel', done)
+  }
+
+  /**
+   * Let go mid-swing and the blade keeps going.
+   *
+   * It glides on the speed it was released with and slows under friction, so a
+   * flick moves it further than the hand did, which is what makes moving
+   * things by hand feel light rather than like dragging a weight. Thrown hard
+   * enough that most of it leaves the screen, it is gone: throwing a card away
+   * is the gesture people reach for when they are done with it.
+   */
+  const fling = useRef(0)
+  const stopFling = () => {
+    cancelAnimationFrame(fling.current)
+    fling.current = 0
+  }
+  useEffect(() => stopFling, [])
+
+  const throwBlade = (vx: number, vy: number) => {
+    if (Math.hypot(vx, vy) < THROW_MIN_SPEED) return
+    let last = performance.now()
+    const step = () => {
+      const now = performance.now()
+      const dt = Math.min(48, now - last)
+      last = now
+      const decay = Math.pow(THROW_FRICTION, dt / 16)
+      vx *= decay
+      vy *= decay
+      setPos((p) => ({ x: p.x + vx * dt, y: p.y + vy * dt }))
+
+      const r = shell.current?.getBoundingClientRect()
+      if (r && r.width && r.height) {
+        const visW = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0))
+        const visH = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0))
+        if ((visW * visH) / (r.width * r.height) < 1 - THROW_AWAY_FRACTION) {
+          fling.current = 0
+          onClose()
+          return
+        }
+      }
+      if (Math.hypot(vx, vy) < 0.02) {
+        fling.current = 0
+        return
+      }
+      fling.current = requestAnimationFrame(step)
+    }
+    fling.current = requestAnimationFrame(step)
   }
 
   const onHeadDown = (e: React.PointerEvent) => {
@@ -350,7 +566,7 @@ function Card({
     if (!focused) onFocus()
     if (expanded) return
     const from = { ...pos }
-    grab(e, (dx, dy) => setPos({ x: from.x + dx, y: from.y + dy }))
+    grab(e, (dx, dy) => setPos({ x: from.x + dx, y: from.y + dy }), throwBlade)
   }
 
   /**
@@ -372,7 +588,7 @@ function Card({
     if (!focused) onFocus()
     if (expanded) return
     const from = { ...pos }
-    grab(e, (dx, dy) => setPos({ x: from.x + dx, y: from.y + dy }))
+    grab(e, (dx, dy) => setPos({ x: from.x + dx, y: from.y + dy }), throwBlade)
   }
 
   /**
@@ -453,17 +669,47 @@ function Card({
     return () => cancelAnimationFrame(raf)
   }, [focused, expanded])
 
-  const onGrip = (e: React.PointerEvent) => {
+  /**
+   * Resize from any corner.
+   *
+   * The blade is centred in its slot, so a change of width moves both edges by
+   * half. Shifting it by that same half keeps the opposite corner where it was
+   * and the grabbed corner under the finger — before, the corner slid away
+   * from the cursor at half speed, which is a lot to chase with a hand.
+   */
+  const onGrip = (corner: 'tl' | 'tr' | 'bl' | 'br') => (e: React.PointerEvent) => {
     const box = shell.current?.getBoundingClientRect()
     if (!box) return
-    const from = { w: box.width, h: box.height }
-    grab(e, (dx, dy) =>
-      setSize({
-        w: Math.max(280, Math.min(window.innerWidth * 0.96, from.w + dx)),
-        h: Math.max(180, Math.min(window.innerHeight * 0.94, from.h + dy)),
-      }),
-    )
+    const from = { w: box.width, h: box.height, x: pos.x, y: pos.y }
+    const sx = corner.endsWith('r') ? 1 : -1
+    const sy = corner.startsWith('b') ? 1 : -1
+    grab(e, (dx, dy) => {
+      const w = Math.max(280, Math.min(window.innerWidth * 0.96, from.w + sx * dx))
+      const h = Math.max(180, Math.min(window.innerHeight * 0.94, from.h + sy * dy))
+      setSize({ w, h })
+      setPos({ x: from.x + (sx * (w - from.w)) / 2, y: from.y + (sy * (h - from.h)) / 2 })
+    })
   }
+
+  /** Right-click menu: Stay (survive the next question) or let go again. */
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  const setHold = useStore((st) => st.setBladeHold)
+  const stays = blade.hold === 'sticky'
+  useEffect(() => {
+    if (!menu) return
+    const close = () => setMenu(null)
+    const onKey = (ev: KeyboardEvent) => ev.key === 'Escape' && close()
+    // Next tick, so the click that opened it does not also close it.
+    const t = setTimeout(() => {
+      window.addEventListener('pointerdown', close)
+      window.addEventListener('keydown', onKey)
+    })
+    return () => {
+      clearTimeout(t)
+      window.removeEventListener('pointerdown', close)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [menu])
 
   /**
    * Resize from the bottom-right grip.
@@ -518,6 +764,10 @@ function Card({
         onPointerDown={() => {
           if (!focused) onFocus()
         }}
+        onContextMenu={(e) => {
+          e.preventDefault()
+          setMenu({ x: e.clientX, y: e.clientY })
+        }}
       >
         <span className="pk pk-tl" />
         <span className="pk pk-tr" />
@@ -527,8 +777,20 @@ function Card({
         <header className="bl-head" onPointerDown={onHeadDown}>
           <span className="bl-title">{blade.title}</span>
           <span className="bl-kind">{blade.kind}</span>
+          {stays && (
+            <button
+              className="bl-stay"
+              onClick={(e) => {
+                e.stopPropagation()
+                setHold(blade.id, 'turn')
+              }}
+              title="Stays through the next question — click to let it go"
+            >
+              STAYS
+            </button>
+          )}
           <span className="bl-acts">
-            {(size || pos.x || pos.y) && !expanded && (
+            {Boolean(size || pos.x || pos.y) && !expanded && (
               <button
                 className="bl-btn"
                 onClick={(e) => {
@@ -568,8 +830,41 @@ function Card({
           <Body blade={blade} />
         </div>
 
-        {/* Resize grip. Absent while expanded, where the size is the point. */}
-        {!expanded && <span className="bl-grip" onPointerDown={onGrip} title="Drag to resize" />}
+        {/* Resize grips on all four corners, with a generous invisible reach so
+            a hand cursor does not have to land on a hairline. Absent while
+            expanded, where the size is the point. */}
+        {!expanded &&
+          (['tl', 'tr', 'bl', 'br'] as const).map((c) => (
+            <span key={c} className={`bl-grip bl-grip-${c}`} onPointerDown={onGrip(c)} title="Drag to resize" />
+          ))}
+
+        {menu &&
+          createPortal(
+            <div
+              className="bl-menu"
+              style={{ left: menu.x, top: menu.y }}
+              onPointerDown={(e) => e.stopPropagation()}
+              onContextMenu={(e) => e.preventDefault()}
+            >
+              <button
+                onClick={() => {
+                  setHold(blade.id, stays ? 'turn' : 'sticky')
+                  setMenu(null)
+                }}
+              >
+                {stays ? 'Don’t stay' : 'Stay'}
+              </button>
+              <button
+                onClick={() => {
+                  setMenu(null)
+                  onClose()
+                }}
+              >
+                Close
+              </button>
+            </div>,
+            document.body,
+          )}
       </motion.section>
     </motion.div>
   )
@@ -624,18 +919,20 @@ export function Blades() {
       if (!live.current) return
       const tag = (e.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      if (useStore.getState().typing) return
       if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return
 
-      if (e.key === 'e') {
+      // Physical keys, so they work on the Greek layout too.
+      if (e.code === 'KeyE') {
         e.preventDefault()
         expandBlade(expandedBlade ? null : (front?.id ?? null))
-      } else if (e.key === 'x') {
+      } else if (e.code === 'KeyX') {
         e.preventDefault()
         if (front) closeBlade(front.id)
-      } else if (e.key === ']') {
+      } else if (e.code === 'BracketRight') {
         e.preventDefault()
         cycle(1)
-      } else if (e.key === '[') {
+      } else if (e.code === 'BracketLeft') {
         e.preventDefault()
         cycle(-1)
       }

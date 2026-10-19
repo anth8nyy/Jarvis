@@ -1,12 +1,13 @@
 import { useEffect, useRef } from 'react'
 import { Scene } from './scene/Scene'
 import { Hud } from './ui/Hud'
+import { TypeBox } from './ui/TypeBox'
 import { Boot } from './ui/Boot'
 import { Ignition } from './ui/Ignition'
 import { Diagnostics } from './ui/Diagnostics'
 import { useStore } from './store'
-import { startVoice, type Voice, type VoiceMode } from './lib/voice'
-import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
+import { onWakeMiss, startVoice, type Voice, type VoiceMode } from './lib/voice'
+import { createSpeaker, cycleVoice, currentVoiceName, speakingNow } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
 import * as hands from './lib/hands'
@@ -15,6 +16,10 @@ import * as camera from './lib/camera'
 import * as kokoro from './lib/kokoro'
 import { TTS_ENGINE } from './config'
 import { forTool, attention } from './lib/fillers'
+import { goodbye, reportHeard } from './lib/bridge'
+import { isGreek } from './lib/lang'
+import { isBareName, stripLeadingName } from './lib/wake'
+import { trimCarryOver } from './lib/carryover'
 import {
   ask,
   warm,
@@ -29,7 +34,7 @@ import {
   usingBridge,
   type Msg,
 } from './lib/brain'
-import { startAnalyser, micLevel } from './lib/audio'
+import { startAnalyser, micLevel, releaseMic } from './lib/audio'
 import { probeCapabilities } from './lib/capabilities'
 import { env } from './config'
 
@@ -54,6 +59,8 @@ const AWAIT_SPEECH_MS = 14000
  *  drops back to standby. Long enough that you don't have to say the name
  *  again to continue a thought. */
 const FOLLOW_UP_MS = 11000
+/** After his name alone, how long to wait for more before answering "Sir?". */
+const GREET_DELAY_MS = 1100
 
 /** crypto.randomUUID needs a secure context, which a LAN address over plain
  *  http is not. Not worth failing a whole turn over an id. */
@@ -61,13 +68,32 @@ const newId = () =>
   globalThis.crypto?.randomUUID?.() ??
   `id${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
 
-/** The same mishearings voice.ts accepts for the wake word — otherwise a turn
- *  that woke him as "travis" gets that word sent on to the model as a question. */
-const NAME = '(?:jarvis|jarvys|jervis|travis|jarviss|java\'s|jarv)'
-/** A bare vocative — "Jarvis", "hey jarvis" — with nothing asked. */
-const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
-/** A leading vocative on a real command: "Jarvis, what's the weather". */
-const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-]*`, 'i')
+/** His name as it may trail a farewell ("goodbye Jarvis"). Waking and the
+ *  name before a request are matched by sound instead — see lib/wake.ts. */
+const NAME =
+  '(?:jarvis|jarvys|jervis|travis|jarviss|java\'s|jarv|τζάρβις|τζαρβις|τζάρβι|τζαρβι|τζάρβη|τζαρβη|ζάρβις|ζαρβις)'
+
+/**
+ * Signing off: "goodbye", "goodnight", "it's time to go" — on their own, with
+ * or without his name. Anchored at both ends, so a question that merely
+ * contains one ("play goodbye yellow brick road") is still a question.
+ */
+const FAREWELL = new RegExp(
+  `^(?:(?:ok|okay|alright|right|well)[,\\s]+)?` +
+    `(?:good\\s*-?\\s*bye|bye(?:\\s*bye)?|good\\s*-?\\s*night|night\\s*night|` +
+    `it'?s\\s+time\\s+to\\s+go|time\\s+to\\s+go|see\\s+you(?:\\s+later|\\s+tomorrow)?|` +
+    `that'?s\\s+all(?:\\s+for\\s+(?:now|today|tonight))?|shut\\s*down|power\\s+(?:off|down)|go\\s+to\\s+sleep|` +
+    // Greek: αντίο, καληνύχτα, γεια σου, τα λέμε, ώρα να φύγω, κλείσε
+    `αντ[ίι]ο|καλην[ύυ]χτα|γεια\\s+σου|γεια|τα\\s+λ[έε]με|[ώω]ρα\\s+να\\s+φ[ύυ]γω|κλε[ίι]σε)` +
+    `(?:[,\\s]+(?:${NAME}|sir|κ[ύυ]ριε|for\\s+now|for\\s+today|for\\s+tonight|για\\s+σ[ήη]μερα|για\\s+απ[όο]ψε))*[\\s,.!?;]*$`,
+  'iu',
+)
+const FAREWELL_LINES = ['Goodnight, sir.', 'Very good, sir. Until next time.', 'Goodbye, sir.']
+const FAREWELL_LINES_EL = ['Καληνύχτα, κύριε.', 'Μάλιστα, κύριε. Τα λέμε.', 'Αντίο, κύριε.']
+
+// Short phrases that were not taken as his name go to the bridge log, so a
+// spelling of "Jarvis" the recogniser produces but the matcher misses can be found.
+onWakeMiss(reportHeard)
 
 export default function App() {
   const store = useStore
@@ -83,6 +109,10 @@ export default function App() {
    */
   const turn = useRef(0)
   const booting = useRef(false)
+  /** The last question asked, so a repeat of it glued to the next can be cut. */
+  const lastQuestion = useRef('')
+  /** A pending "Κύριε;" after his name alone — see onWake. */
+  const greetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -124,6 +154,28 @@ export default function App() {
   // -- one turn -------------------------------------------------------------
 
   const respond = async (said: string): Promise<void> => {
+    // Signing off is handled here, not by the model: it should be instant, and
+    // it must work even when the brain is busy or slow.
+    if (FAREWELL.test(stripLeadingName(said))) {
+      turn.current++
+      clearIdle()
+      silence()
+      interrupt()
+      const s = store.getState()
+      s.pushTurn({ id: newId(), role: 'user', text: said })
+      s.setPhase('speaking')
+      const bye = createSpeaker()
+      speaker.current = bye
+      const lines = isGreek() ? FAREWELL_LINES_EL : FAREWELL_LINES
+      bye.say(lines[Math.floor(Math.random() * lines.length)])
+      // Never hang on a voice that fails to finish: leave after a few seconds
+      // whatever happens.
+      await Promise.race([bye.end(), new Promise((r) => setTimeout(r, 4000))])
+      goodbye()
+      return
+    }
+
+    lastQuestion.current = said
     const mine = ++turn.current
     const stale = () => mine !== turn.current
 
@@ -146,6 +198,30 @@ export default function App() {
     let started = false
     let filled = false
 
+    // Said once. The model sometimes writes its answer twice in one turn —
+    // typically before and again after showing a panel ("Fifty-one, sir.
+    // Fifty-one, sir."). So after every finished sentence, new text is held
+    // while it is an exact repeat of something already said; if that is all it
+    // turns out to be, it is dropped. The moment it says something new, it
+    // flows on — a fraction of a second's hold at most.
+    let said_ = ''
+    let held = ''
+    let checking = false
+    const squash = (t: string) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
+    const emit = (delta: string) => {
+      // Text from before and after a panel joins with no space — "sir.Saturday"
+      // — which reads badly and is spoken without a breath. Put the space back.
+      if (/[.!?…;]["'»”’)\]]?$/.test(said_) && /^[\p{L}\p{N}"'«“(]/u.test(delta)) delta = ' ' + delta
+      store.getState().appendToLastTurn(delta)
+      spk.push(delta)
+      said_ += delta
+      // A sentence just ended: whatever comes next may be a repeat.
+      if (/[.!?…;]["'»”’)\]]?\s*$/.test(said_)) {
+        checking = true
+        held = ''
+      }
+    }
+
     try {
       const { text } = await ask(said, history.current, {
         onText: (delta) => {
@@ -159,8 +235,22 @@ export default function App() {
             music.working(false)
             store.getState().pushTurn({ id: turnId, role: 'jarvis', text: '' })
           }
-          store.getState().appendToLastTurn(delta)
-          spk.push(delta)
+          // Text arrives in small pieces and a sentence can end mid-piece
+          // ("…sir.Fif"), so take each piece apart at sentence ends first.
+          for (const part of delta.split(/(?<=[.!?…;])/u)) {
+            if (!part) continue
+            if (checking) {
+              held += part
+              const h = squash(held)
+              if (!h || squash(said_).includes(h)) continue // still a repeat so far
+              checking = false
+              const out = held
+              held = ''
+              emit(out)
+              continue
+            }
+            emit(part)
+          }
         },
         onTool: (name) => {
           if (stale()) return
@@ -169,6 +259,11 @@ export default function App() {
           // rest of any answer that called a tool after it started talking,
           // which also broke the reactor's lip-sync for the remainder.
           if (!started) store.getState().setPhase('tooling')
+          // A tool after he has started talking: watch for a repeat. See emit.
+          if (started) {
+            checking = true
+            held = ''
+          }
           store.getState().setActiveTool(name)
           sfx.play('tool')
           music.working(true)
@@ -211,6 +306,9 @@ export default function App() {
         music.duck(false)
         store.getState().setActiveTool(null)
         music.working(false)
+        // A clean slate before listening again: whatever the recogniser still
+        // holds from his answer must not start the next question.
+        voice.current?.flush()
         // Stay open. Having to say his name again to add one more sentence is
         // the difference between a conversation and a vending machine.
         listen(FOLLOW_UP_MS)
@@ -222,6 +320,7 @@ export default function App() {
 
   /** What the voice loop should do with what it hears, derived from phase. */
   const mode = (): VoiceMode => {
+    if (store.getState().muted) return 'deaf'
     switch (store.getState().phase) {
       case 'offline':
       case 'boot':
@@ -245,22 +344,28 @@ export default function App() {
 
     // "Jarvis, what's happening in AI this week" in one breath. Waiting for a
     // greeting he didn't need is the most common way an assistant wastes time.
-    if (trailing) {
-      void respond(trailing)
+    const asked = trailing ? trimCarryOver(trailing, speakingNow(), lastQuestion.current) : ''
+    if (asked) {
+      void respond(asked)
       return
     }
 
     store.getState().setPhase('waking')
-
-    // Answer to his name. Deliberately NOT awaited any more: the microphone is
-    // already open and the echo filter knows his voice, so the user can talk
-    // straight over the greeting instead of waiting it out.
-    const greeting = createSpeaker()
-    speaker.current = greeting
-    greeting.say(attention())
-    void greeting.end()
-
     listen(AWAIT_SPEECH_MS)
+
+    // Answer to his name — but only if they stop there. "Τζάρβις, τι ώρα
+    // είναι" is usually one breath, and the recogniser hears the name a beat
+    // before the rest: greeting at once meant "Κύριε;" spoken straight over the
+    // question. So wait a moment; if more words arrive, stay quiet and listen.
+    if (greetTimer.current) clearTimeout(greetTimer.current)
+    greetTimer.current = setTimeout(() => {
+      greetTimer.current = null
+      if (store.getState().phase !== 'listening' || store.getState().caption) return
+      const greeting = createSpeaker()
+      speaker.current = greeting
+      greeting.say(attention())
+      void greeting.end()
+    }, GREET_DELAY_MS)
   }
 
   /**
@@ -295,11 +400,12 @@ export default function App() {
 
     // People keep using his name as a vocative once they're already talking to
     // him. Strip it rather than sending "jarvis" to the model as a question.
-    if (BARE_NAME.test(text)) {
+    if (isBareName(text)) {
       listen(AWAIT_SPEECH_MS)
       return
     }
-    const said = text.replace(LEADING_NAME, '').trim()
+    // Cut any lead-in carried over from his last answer or the last question.
+    const said = trimCarryOver(stripLeadingName(text), speakingNow(), lastQuestion.current)
     if (!said) {
       listen(AWAIT_SPEECH_MS)
       return
@@ -309,6 +415,11 @@ export default function App() {
   }
 
   const onPartial = (text: string) => {
+    // They kept talking after his name: no greeting needed.
+    if (text && greetTimer.current) {
+      clearTimeout(greetTimer.current)
+      greetTimer.current = null
+    }
     store.getState().setCaption(text)
   }
 
@@ -346,6 +457,37 @@ export default function App() {
     }
   }
 
+  /** Open the microphone: the reactor's analyser, then the voice loop. */
+  const openEars = async () => {
+    // The analyser is what makes the reactor pulse with your voice. It needs a
+    // getUserMedia stream; speech recognition does not, and gets its own. So a
+    // failure here costs the animation and nothing else — saying "voice input
+    // is unavailable" was both alarming and untrue.
+    try {
+      await startAnalyser()
+    } catch {
+      console.warn(
+        '[jarvis] no microphone stream — the reactor will not pulse with your ' +
+          'voice. Speech recognition is unaffected.',
+      )
+    }
+    voice.current = await startVoice({
+      mode,
+      onWake,
+      onSpeechStart,
+      onPartial,
+      onUtterance,
+      onError: onVoiceError,
+    })
+  }
+
+  /** Close the microphone completely — mute. The system's mic light goes out. */
+  const closeEars = () => {
+    voice.current?.stop()
+    voice.current = null
+    releaseMic()
+  }
+
   const ignite = async () => {
     const s = store.getState()
 
@@ -363,7 +505,9 @@ export default function App() {
 
     watchServers((servers) => store.getState().setConnected(servers))
     watchPanels((panel) => store.getState().pushPanel(panel))
-    watchBlades((blade) => store.getState().pushBlade(blade))
+    watchBlades((blade) =>
+      blade.cancel ? store.getState().closeBlade(blade.id) : store.getState().pushBlade(blade),
+    )
 
     /**
      * JARVIS asking to see something.
@@ -496,33 +640,15 @@ export default function App() {
     store.getState().setConnected(connectedLabels())
     store.getState().setVoice(currentVoiceName())
 
-    // The analyser is what makes the reactor pulse with your voice. It needs a
-    // getUserMedia stream; speech recognition does not, and gets its own. So a
-    // failure here costs the animation and nothing else — saying "voice input
-    // is unavailable" was both alarming and untrue.
-    try {
-      await startAnalyser()
-    } catch {
-      console.warn(
-        '[jarvis] no microphone stream — the reactor will not pulse with your ' +
-          'voice. Speech recognition is unaffected.',
-      )
-    }
-
     // Ask the bridge which speech engines exist before the loop starts, so the
     // first turn already uses ElevenLabs when a key is present and the browser
     // fallback when it is not — no flag, no reload.
     await probeCapabilities()
 
     // One voice loop, started once, running until the page closes.
-    voice.current = await startVoice({
-      mode,
-      onWake,
-      onSpeechStart,
-      onPartial,
-      onUtterance,
-      onError: onVoiceError,
-    })
+    // One voice loop, running until the page closes — or until mute closes
+    // the microphone, when openEars starts it again on unmute.
+    if (!store.getState().muted) await openEars()
 
     store.getState().setPhase('dormant')
   }
@@ -558,12 +684,37 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase])
 
+  // -- mute closes the microphone ----------------------------------------------
+
+  // Mute used to leave the microphone open and simply ignore it — the mic light
+  // stayed on and the recogniser kept running. Now it is really off: the voice
+  // loop stops and the stream is released; unmute opens it again. Before boot
+  // there is nothing to open — ignite checks the flag itself.
+  useEffect(
+    () =>
+      store.subscribe((st, prev) => {
+        if (st.muted === prev.muted) return
+        if (st.phase === 'offline' || st.phase === 'boot') return
+        if (st.muted) closeEars()
+        else if (!voice.current) void openEars()
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+
   // -- level pump + keys ----------------------------------------------------
 
   useEffect(() => {
     let raf = 0
 
+    let lastLevelAt = 0
     const pump = () => {
+      raf = requestAnimationFrame(pump)
+      // About 30 times a second is plenty for a pulse — the scene smooths it
+      // anyway — and every update re-renders whatever reads the level.
+      const now = performance.now()
+      if (now - lastLevelAt < 33) return
+      lastLevelAt = now
       const st = store.getState()
       // While speaking, follow JARVIS's own output rather than the mic, so the
       // orb lip-syncs instead of reacting to room noise.
@@ -571,20 +722,26 @@ export default function App() {
         st.phase === 'speaking' && speaker.current
           ? speaker.current.level()
           : micLevel()
-      st.setLevel(lvl)
-      raf = requestAnimationFrame(pump)
+      // Skip changes too small to see.
+      if (Math.abs(lvl - st.level) > 0.004) st.setLevel(lvl)
     }
     pump()
 
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      // Never while the typing line is open, even if focus wandered off it —
+      // a word with "μ" or "γ" in it must not mute or start the camera.
+      if (store.getState().typing) return
+      // Keys are matched by physical position (e.code), not by the letter they
+      // produce, so they work with the Greek keyboard layout too: the M key
+      // gives "μ" there, but its code is still KeyM.
 
       // V auditions the next British voice installed on this machine. Which
       // ones exist varies per Mac, so hearing them beats trusting a ranking.
       // Bare V only — ⌘V and ⌃V are paste, and swallowing those was rude.
       if (
-        e.key === 'v' &&
+        e.code === 'KeyV' &&
         !e.repeat &&
         !e.metaKey &&
         !e.ctrlKey &&
@@ -604,7 +761,14 @@ export default function App() {
       // G puts the camera on and starts tracking hands. Off by default and
       // never implicit: a webcam that turns itself on because an interface
       // thought it might be useful is not a trade anyone agreed to.
-      if (e.key === 'g' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      // M mutes the microphone, same as the button by the status light.
+      if (e.code === 'KeyM' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault()
+        store.getState().setMuted(!store.getState().muted)
+        return
+      }
+
+      if (e.code === 'KeyG' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault()
         const on = store.getState().gestures
         if (on) {
@@ -629,25 +793,14 @@ export default function App() {
         return
       }
 
-      // T speaks a fixed line, bypassing the wake word, the recogniser and the
-      // model entirely. When "I can't hear him" is the report, this is the one
-      // keypress that separates a broken voice engine from a broken voice loop
-      // — and it prints the verdict rather than making you infer it.
-      if (e.key === 't' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      // T opens the typing line — for anything easier written than said, and
+      // for Greek. (T used to run a one-line audio test; D's diagnostics
+      // panel covers that.)
+      if (e.code === 'KeyT' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        const ph = store.getState().phase
+        if (ph === 'offline' || ph === 'boot') return
         e.preventDefault()
-        silence()
-        const t = createSpeaker()
-        speaker.current = t
-        t.say('Audio test. If you can hear this, speech output is working, sir.')
-        void t.end().then(() => {
-          const d = (window as unknown as Record<string, Record<string, unknown>>).__tts
-          console.info('[jarvis] audio test →', d)
-          if (d && d.started === 0 && d.rescued === 0) {
-            store.getState().setError(
-              `No sound produced. engine=${d.engine} voice=${d.voice} error=${d.lastError || 'none'}`,
-            )
-          }
-        })
+        store.getState().setTyping(true)
         return
       }
 
@@ -699,6 +852,14 @@ export default function App() {
     <>
       <Scene />
       <Hud />
+      <TypeBox
+        onSubmit={(text) => {
+          // A typed question is a turn like a spoken one: stop whatever he is
+          // doing first, exactly as talking over him would, then answer it.
+          onSpeechStart()
+          void respond(text)
+        }}
+      />
       <Boot />
       <Diagnostics />
       <Ignition onStart={() => void powerOn()} />

@@ -16,6 +16,8 @@
  */
 
 import { KOKORO_VOICE } from '../config'
+import ortMjs from '../../node_modules/@huggingface/transformers/dist/ort-wasm-simd-threaded.jsep.mjs?url'
+import ortWasm from '../../node_modules/@huggingface/transformers/dist/ort-wasm-simd-threaded.jsep.wasm?url'
 
 type Kokoro = {
   generate: (
@@ -76,7 +78,11 @@ export async function load(): Promise<Kokoro | null> {
 
   loading = (async () => {
     try {
-      const { KokoroTTS } = await import('kokoro-js')
+      const { KokoroTTS, env } = await import('kokoro-js')
+      // kokoro-js points the ONNX runtime at jsDelivr by default, which the
+      // CSP in index.html (rightly) refuses to load scripts from. Serve the
+      // same files from our own origin instead.
+      env.wasmPaths = { mjs: ortMjs, wasm: ortWasm }
       const tts = await KokoroTTS.from_pretrained(
         'onnx-community/Kokoro-82M-v1.0-ONNX',
         {

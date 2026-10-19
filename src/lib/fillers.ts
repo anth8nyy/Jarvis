@@ -1,3 +1,9 @@
+import { isGreek } from './lang'
+
+/* Greek: the same butler register — "κύριε", short, never chatty. */
+const WORKING_EL = ['Αμέσως, κύριε.', 'Το ψάχνω.', 'Ένα λεπτό.', 'Ανακτώ τα στοιχεία.', 'Σε εξέλιξη.']
+const ACKNOWLEDGE_EL = ['Μάλιστα, κύριε.', 'Όπως επιθυμείτε.', 'Έγινε.', 'Κατανοητό.', 'Αμέσως, κύριε.']
+const ATTENTION_EL = ['Κύριε;', 'Μάλιστα, κύριε;', 'Στις διαταγές σας.', 'Σας ακούω, κύριε.']
 /**
  * Filler speech.
  *
@@ -63,9 +69,15 @@ function makePicker(pool: string[]) {
   }
 }
 
-export const working = makePicker(WORKING)
-export const acknowledge = makePicker(ACKNOWLEDGE)
-export const attention = makePicker(ATTENTION)
+const workingEn = makePicker(WORKING)
+const acknowledgeEn = makePicker(ACKNOWLEDGE)
+const attentionEn = makePicker(ATTENTION)
+const workingEl = makePicker(WORKING_EL)
+const acknowledgeEl = makePicker(ACKNOWLEDGE_EL)
+const attentionEl = makePicker(ATTENTION_EL)
+export const working = () => (isGreek() ? workingEl() : workingEn())
+export const acknowledge = () => (isGreek() ? acknowledgeEl() : acknowledgeEn())
+export const attention = () => (isGreek() ? attentionEl() : attentionEn())
 
 /**
  * Naming the task is warmer than a generic acknowledgement and shows the
@@ -188,6 +200,9 @@ function split(toolName: string): { server: string; tool: string } {
 
 /** A phrase suited to the tool that just fired. */
 export function forTool(toolName: string): string {
+  // The tool-specific lines are English; in Greek a neutral one reads better
+  // than a translated quip.
+  if (isGreek()) return working()
   const { server, tool } = split(toolName)
   for (const r of pickers) {
     const hit =

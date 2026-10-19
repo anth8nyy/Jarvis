@@ -29,6 +29,8 @@ const ROTATE_MS = 4200
 export function Suggestions() {
   const phase = useStore((s) => s.phase)
   const turns = useStore((s) => s.turns)
+  // Typing (or anything being heard) shows in this same spot — make way.
+  const busy = useStore((s) => s.typing || Boolean(s.caption))
   const [i, setI] = useState(0)
 
   useEffect(() => {
@@ -38,7 +40,7 @@ export function Suggestions() {
 
   // Only while genuinely idle, and only until the first exchange — once the
   // user knows how it works, the prompt is just clutter.
-  if (phase !== 'dormant' || turns.length > 0) return null
+  if (phase !== 'dormant' || turns.length > 0 || busy) return null
 
   return (
     <div className="suggest">

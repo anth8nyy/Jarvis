@@ -21,6 +21,12 @@ import { displayServer } from './panels.mjs'
 import { uiServer } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
 import { visionServer } from './vision.mjs'
+import { safariServer } from './safari.mjs'
+import { appsServer, quitJarvis } from './apps.mjs'
+import { agenda, calendarServer } from './calendar.mjs'
+import { memoryPrompt, memoryServer } from './memory.mjs'
+import { startIMessage } from './imessage.mjs'
+import { filesServer } from './files.mjs'
 import { homedir, tmpdir } from 'node:os'
 import { readFileSync, realpathSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
@@ -279,6 +285,24 @@ function decideTool(name) {
     // indicator the user can see for as long as it is live.
     if (server === 'jarvis_eyes') return true
 
+    // Opens a search or a page in Safari for the user to watch. It can do
+    // nothing else — see safari.mjs — so, like the display, it is not held
+    // back behind ALLOW_WRITES.
+    if (server === 'jarvis_safari') return true
+
+    // Launches an installed app the user named, and nothing else — see
+    // apps.mjs. Asked for in so many words, so not held behind ALLOW_WRITES.
+    if (server === 'jarvis_apps') return true
+
+    // The user's own calendar, reminders and JARVIS's memory file — asked for
+    // explicitly. Deletions are confirmed out loud first; see the prompt.
+    if (server === 'jarvis_calendar' || server === 'jarvis_memory') return true
+
+    // Creating files and folders the user asked for. Create-only: it cannot
+    // delete, and refuses to replace a file without an explicit overwrite —
+    // see files.mjs for the places it will not touch.
+    if (server === 'jarvis_files') return true
+
     const tool = mcpToolOf(name)
     if (EFFECTFUL_VERB.test(tool) && !VETO_EXEMPT.has(`${server}__${tool}`)) {
       return ALLOW_WRITES
@@ -437,6 +461,144 @@ Using tools:
   Put the source in the panel as a short tag like "REUTERS" instead.
 - If a tool fails or isn't connected, one plain sentence saying so.
 - If you don't know, say you don't know.`
+
+
+/**
+ * Whether the user's Chrome can be driven. Learned once at startup (see the
+ * banner below); the prompt is built per connection from it.
+ */
+let chromeReady = false
+
+/**
+ * Said instead of the Chrome section when the extension is not there.
+ *
+ * The base prompt orders every web task through the chrome_* tools first. With
+ * no extension that order sends him to a tool that cannot work — so "what's in
+ * the news today" spent the turn failing at Chrome and came back with nothing.
+ */
+const NO_CHROME = `The user's Chrome cannot be driven on this machine: there are no chrome_*
+tools. Do not mention Chrome or try to reach it.`
+
+const WEB_SECTION = `Looking things up:
+- For anything current or factual you are not certain of — today's news,
+  prices, scores, weather, people, events, anything that may have changed —
+  search. Never answer such a question from memory.
+- WebSearch finds it; WebFetch reads a page when the snippets are not enough.
+- Search quietly. Do NOT open Safari for a search — the answer belongs in
+  this interface. Use \`safari_search\` or \`safari_open\` only when they
+  explicitly ask to see it in Safari — or when they want to BUY something.
+- Shopping is the exception. "Where can I buy …", "find me … to buy", "how
+  much is … and where", in any language: search, pick the best page to buy
+  it from (a real product or shop page from the results — never a guessed
+  URL), and open it with \`safari_open\`. If no single page is clearly best,
+  open a \`safari_search\` for it instead. Do NOT put it on a blade. Then say
+  one short sentence: where you opened it and the price if you saw one.
+- Always show what you found on a blade with \`display\` — headlines as rows,
+  a figure as a metric — and speak the gist, in a sentence or two.`
+
+const CALC_SECTION = `Calculations — always on screen:
+- Whenever they ask you to work something out — arithmetic, percentages, unit
+  or currency conversions, splitting a bill, a date difference — put it in a
+  box with \`display\`, exactly as you do for the time: the expression on one
+  line and the result large, e.g.
+  <div><span class="hud-unit">17 × 23 + 4</span><span class="hud-metric">395</span></div>
+- Then say only the answer, one short sentence. Do not read the working aloud.
+- Work it out exactly; check it before you show it.`
+
+const APPS_SECTION = `Their applications:
+- When they ask you to open, launch or start an app — Spotify, Notes, Mail,
+  anything installed — call \`open_app\` with its name. Act, then report in a
+  few words: "Spotify is open, sir." No blade needed.
+- If the result says several match, choose the obvious one or ask once.
+- If it is not installed, say so in one sentence.
+- "Close Spotify" → \`close_app\`. "Close all the apps", "close everything" →
+  \`close_all_apps\`, which never closes you. Then report briefly; if some
+  stayed open to ask about saving, say which, in one sentence.`
+
+const CALENDAR_SECTION = `Their calendar and reminders (Apple Calendar and Reminders):
+- "What's on my schedule today", "what do I have tomorrow", "am I free on
+  Friday" → \`calendar_events\` for that range, plus \`reminders_list\` for the
+  same range when it is a day's agenda. Read it out briefly in time order —
+  "At eleven, physics book; nothing after." — and show it on a blade as rows.
+  An empty day: "Your calendar is clear today, sir."
+- "Remind me to …" → \`reminder_create\`, with a due time if they gave one.
+  "Put … in my calendar", a meeting or appointment → \`calendar_create_event\`.
+  Work out exact local times from the [Local time] stamp; "tomorrow at six"
+  means 18:00 unless context says morning. Confirm in one sentence with the
+  day and time.
+- To change or delete, list first to get the id. Changes: just do it, then
+  confirm. Deleting: say which one in one sentence and ask "Shall I delete it?";
+  delete only after they say yes.
+- "Open my calendar" → \`open_app\` Calendar.`
+
+const IMESSAGE_SECTION = `Text messages:
+- A message beginning "[iMessage]" was TEXTED to you from their phone; they are
+  probably away from this Mac and cannot see the screen or hear you. Your
+  reply is sent back to them as a text.
+- So for those: the answer goes in your words, not on a blade. Up to four
+  short sentences, plain text, no markdown. Write times and numbers as
+  digits ("7:30pm", "19°C") — this is read, not spoken.
+- Same character, same tools. Before anything that sends, deletes or
+  changes something, ask and end with "Reply yes to confirm."
+- Never open apps or change the interface for a text unless they ask; no one
+  is in front of the Mac to see it.`
+
+const FILES_SECTION = `Files and folders on their Mac:
+- "Make a folder called Physics on my Desktop", "create a file with my shopping
+  list in Documents" → \`create_folder\` / \`create_file\`. Paths can start with
+  ~ ("~/Desktop/…"); Desktop, Documents and Downloads are the usual places.
+  If they name no place, use the Desktop.
+- Write the content they asked for, properly formatted for the file type.
+  Pass reveal: true so it is shown in Finder.
+- If the file already exists, say so and ask "Shall I replace it?"; only after
+  yes, call again with overwrite: true.
+- Then confirm in one sentence where it is ("It's on your Desktop, sir.").
+  You cannot delete files; if asked, say so once.`
+
+const LIVE_SECTION = `Live panels — things that change go on a live blade, not a picture:
+- The time or the date ("what time is it", "what's the date", "τι ώρα είναι")
+  → \`clock\`, which keeps ticking. In another city → \`clock\` with its IANA
+  time zone and the city as label. Never put the time in \`display\` — a
+  static panel goes stale within a minute.
+- A countdown → \`countdown\`. A stopwatch / timing something → \`stopwatch\`.
+  Stopping either → \`countdown_cancel\`.
+- For local time call \`clock\` with no time zone at all.
+- ALWAYS say the actual answer out loud first, to the exact minute — "It's
+  twenty-eight minutes past two, sir.", not a rounded "half past",
+  "Είναι Σάββατο δεκαεπτά Οκτωβρίου." Work it out from the [Local time] stamp
+  (and the zone difference for another city). Never say only that something
+  is "on screen": the screen is extra, the spoken answer is the answer.
+  Put everything worth saying in that one sentence ("It's half past eight in
+  the evening in Tokyo, six hours ahead of you."), then call the tool — and
+  after it, write NOTHING more: no recap, no "it's on screen", no rewording.`
+
+const TIMING_SECTION = `Speak first, show second:
+- Your words are spoken the moment they are written, but nothing is said
+  while you are calling a tool. So when you already know the answer — the
+  time, a calculation, a fact — write your spoken sentence FIRST, then call
+  \`display\` to show it. Only when you must look something up does the
+  tool come first.
+- Say it ONCE. Text you wrote before a tool call has already been spoken, so
+  after \`display\` (or any tool) do not repeat or rephrase it — end the turn,
+  or add only something genuinely new.`
+
+const LANGUAGE_SECTION = `Language:
+- Always answer in English — spoken, on blades, everywhere — whatever
+  language the question came in.
+- They often type in Greek, because some things they cannot yet say in
+  English. Understand the Greek exactly as meant (translate it for yourself,
+  search in whichever language finds the better answer), then reply in
+  natural English. Do not translate the question back to them or comment on
+  the language; just answer it.`
+
+
+function systemPrompt() {
+  let prompt = SYSTEM_PROMPT
+  if (!chromeReady) {
+    prompt = prompt.replace(/Their browser — ALWAYS[\s\S]*?(?=\nYour eyes:)/, NO_CHROME + '\n')
+  }
+  return [prompt, TIMING_SECTION, LIVE_SECTION, LANGUAGE_SECTION, WEB_SECTION, CALC_SECTION, APPS_SECTION, CALENDAR_SECTION, FILES_SECTION, IMESSAGE_SECTION, memoryPrompt()].join('\n\n')
+}
 
 /**
  * ElevenLabs credentials, borrowed from the MCP server config.
@@ -676,6 +838,13 @@ const handleRequest = async (req, res) => {
     return res.end()
   }
 
+  // Today's calendar and reminders, for the agenda box in the corner.
+  if (req.method === 'GET' && req.url === '/agenda') {
+    const data = await agenda().catch((err) => ({ ok: false, error: String(err?.message ?? err) }))
+    res.writeHead(200, { ...cors, 'content-type': 'application/json' })
+    return res.end(JSON.stringify(data))
+  }
+
   if (req.method === 'GET' && req.url === '/health') {
     // The browser reads this once at boot to decide which voice engine to use.
     // Both premium paths ride the same ElevenLabs key, so both flags track it:
@@ -684,7 +853,9 @@ const handleRequest = async (req, res) => {
     // student with nothing configured still has a working assistant.
     const eleven = Boolean(elevenKey())
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
-    return res.end(JSON.stringify({ ok: true, tts: eleven, stt: eleven }))
+    // `windows` lets the desktop launcher tell a live JARVIS window from a
+    // leftover background Chrome with nothing in it.
+    return res.end(JSON.stringify({ ok: true, tts: eleven, stt: eleven, windows: windowCount }))
   }
 
   // Serve local image files to the page. Screenshots and generated art land on
@@ -999,6 +1170,8 @@ const wss = new WebSocketServer({
   },
 })
 server.listen(PORT)
+// Texting JARVIS from the user's phone. Does nothing unless configured.
+startIMessage(PORT)
 
 console.log(`[jarvis] bridge listening on ws://localhost:${PORT}`)
 console.log(
@@ -1014,6 +1187,7 @@ console.log(
 // at the tool boundary from one that is broken, and this is the one place the
 // difference can be stated before anybody asks a question that depends on it.
 void chromeAvailable().then((ok) => {
+  chromeReady = ok
   console.log(
     ok
       ? `[jarvis] browser control ready${ALLOW_WRITES ? '' : ' (reading only — clicking and typing need JARVIS_ALLOW_WRITES=1)'}`
@@ -1039,8 +1213,40 @@ const RESULT_FAILURES = {
   default: 'The turn ended without an answer.',
 }
 
-wss.on('connection', (socket) => {
+/**
+ * Closing the window closes JARVIS.
+ *
+ * On a Mac, closing a Chrome window leaves Chrome itself running, so the
+ * desktop app's servers never stopped — and the next launch had to clear up a
+ * half-alive JARVIS, which is where opening went wrong. The window's socket is
+ * the clearest sign it is gone: when the last one has been closed for a few
+ * seconds (long enough to survive a reload), quit JARVIS's own Chrome, and the
+ * launcher stops everything else. Minimising or switching Spaces keeps the
+ * socket open, so neither counts. The iMessage link is not a window.
+ */
+let windowCount = 0
+let everHadWindow = false
+let closeTimer = null
+const WINDOW_GRACE_MS = 5000
+
+wss.on('connection', (socket, req) => {
   console.log('[jarvis] client connected')
+  const isWindow = !String(req?.url ?? '').includes('client=imessage')
+  if (isWindow) {
+    windowCount++
+    everHadWindow = true
+    clearTimeout(closeTimer)
+    socket.on('close', () => {
+      windowCount--
+      if (windowCount > 0 || !everHadWindow) return
+      clearTimeout(closeTimer)
+      closeTimer = setTimeout(() => {
+        if (windowCount > 0) return
+        console.log('[jarvis] window closed — shutting down')
+        void quitJarvis()
+      }, WINDOW_GRACE_MS)
+    })
+  }
 
   // Answer the HUD straight away rather than making it wait for the agent's
   // first turn. Refined later by the real init message.
@@ -1061,9 +1267,18 @@ wss.on('connection', (socket) => {
           deliver = resolve
         }))
       if (closed || text == null) return
+      // The model has no clock. Asked the time, it reached for `date` in a
+      // shell, which the read-only gate rightly refuses — and the answer died
+      // with it. Stamping each question with the machine's local time lets
+      // "what time is it" and "what's today" be answered without a tool.
+      const now = new Date().toLocaleString('en-GB', {
+        weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        timeZoneName: 'short',
+      })
       yield {
         type: 'user',
-        message: { role: 'user', content: text },
+        message: { role: 'user', content: `[Local time: ${now}]\n${text}` },
         parent_tool_use_id: null,
       }
     }
@@ -1168,6 +1383,31 @@ wss.on('connection', (socket) => {
    */
   const SETTLE_CAP_MS = 400
 
+  /**
+   * After a live panel — clock, countdown, stopwatch — the answer is complete:
+   * he has already said it, and the panel shows the rest. The model kept adding
+   * a line after the tool anyway ("The clock is refreshed, sir."), so from that
+   * point in the turn its text is simply not passed on. `turnText` is what was
+   * actually said, which is what the turn's result should carry.
+   */
+  let afterLive = false
+  let turnText = ''
+  /**
+   * After an ordinary panel the model often signs off with a word — "Done.",
+   * "Shown." — which is then spoken. Text after a panel is held until it is
+   * clearly more than that (over four words, then it flows) or the turn ends
+   * (a short tail is dropped).
+   */
+  let afterPanel = false
+  let tail = ''
+  const flushTail = () => {
+    if (!tail) return
+    turnText += tail
+    sendTurn({ type: 'text', delta: tail })
+    tail = ''
+  }
+  const LIVE_TOOL = /^mcp__jarvis__(clock|countdown|stopwatch)$/
+
   const announceTool = (id, name) => {
     if (!name || (id && seenTools.has(id))) return
     if (id) seenTools.add(id)
@@ -1214,12 +1454,22 @@ wss.on('connection', (socket) => {
         jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }),
         // The camera, which unlike everything else here has to ask and wait.
         jarvis_eyes: visionServer(ask),
+        // Safari, so the user can watch a search happen. See safari.mjs.
+        jarvis_safari: safariServer(),
+        // Opening the user's applications by name. See apps.mjs.
+        jarvis_apps: appsServer(),
+        // Apple Calendar and Reminders, through the native helper. See calendar.mjs.
+        jarvis_calendar: calendarServer(),
+        // What survives a restart. See memory.mjs.
+        jarvis_memory: memoryServer(),
+        // Making files and folders on the Mac. See files.mjs.
+        jarvis_files: filesServer(),
       },
       // A plain system prompt, not the claude_code preset. The preset is
       // tuned for a coding agent — verbose, file-oriented, and a large chunk
       // of input tokens on every turn. Replacing it makes the persona stick,
       // keeps answers short enough to speak, and cuts cost per turn.
-      systemPrompt: SYSTEM_PROMPT,
+      systemPrompt: systemPrompt(),
       // Run from the home directory so project-scoped MCP servers don't shadow
       // the global ones, and so file tools have a sane root.
       cwd: homedir(),
@@ -1298,14 +1548,34 @@ wss.on('connection', (socket) => {
             if (
               ev?.type === 'content_block_delta' &&
               ev.delta?.type === 'text_delta' &&
-              ev.delta.text
+              ev.delta.text &&
+              !afterLive
             ) {
-              sendTurn({ type: 'text', delta: ev.delta.text })
+              if (afterPanel) {
+                tail += ev.delta.text
+                if (tail.trim().split(/\s+/).length > 4) {
+                  afterPanel = false
+                  flushTail()
+                }
+              } else {
+                turnText += ev.delta.text
+                sendTurn({ type: 'text', delta: ev.delta.text })
+              }
             }
             if (
               ev?.type === 'content_block_start' &&
               ev.content_block?.type === 'tool_use'
             ) {
+              if (LIVE_TOOL.test(ev.content_block.name ?? '')) afterLive = true
+              else if (ev.content_block.name === 'mcp__jarvis__display' || ev.content_block.name === 'mcp__jarvis__blade') {
+                // A held tail before this panel was real text: let it out.
+                flushTail()
+                afterPanel = true
+              } else {
+                // Any other tool: work is continuing, whatever follows is real.
+                afterPanel = false
+                flushTail()
+              }
               announceTool(ev.content_block.id, ev.content_block.name)
             }
             break
@@ -1343,9 +1613,14 @@ wss.on('connection', (socket) => {
             // nothing to say — the HUD stops spinning and JARVIS stands there
             // silent. Say what happened instead.
             if (msg.subtype === 'success') {
+              // A short line after a panel is only dropped when something was
+              // said before it — if it is the whole answer, it is the answer.
+              if (tail && !turnText.trim()) flushTail()
               sendTurn({
                 type: 'done',
-                text: msg.result ?? '',
+                // What was actually said, when a live panel cut the turn short;
+                // otherwise the model's own final text, as before.
+                text: (afterLive || afterPanel) && turnText ? turnText : (msg.result ?? ''),
                 costUsd: msg.total_cost_usd ?? null,
               })
             } else {
@@ -1362,6 +1637,10 @@ wss.on('connection', (socket) => {
             // the only place a turn is genuinely over.
             finishTurn?.()
             finishTurn = null
+            afterLive = false
+            afterPanel = false
+            tail = ''
+            turnText = ''
             // One turn's tool ids are never referred to again, and these
             // otherwise grow for as long as the socket is open.
             seenTools.clear()
@@ -1438,6 +1717,20 @@ wss.on('connection', (socket) => {
         clearTimeout(slot.timer)
         slot.resolve(msg)
       }
+    }
+
+    // A short phrase the page did not take as his name — logged so missed
+    // spellings of "Jarvis" can be found. Only ever written to the local log.
+    if (msg.type === 'heard' && typeof msg.text === 'string') {
+      console.log(`[jarvis] heard, not taken as his name: "${msg.text.slice(0, 120)}"`)
+      return
+    }
+
+    // "Goodbye, Jarvis." The page has already said its farewell; close it.
+    if (msg.type === 'goodbye') {
+      console.log('[jarvis] goodbye — closing')
+      void quitJarvis()
+      return
     }
 
     if (msg.type === 'interrupt') {

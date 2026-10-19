@@ -101,7 +101,10 @@ export const TIPS = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
  * responsive. Filtering both identically made the drawing feel dead.
  */
 const CURSOR_MIN_CUTOFF = 1.1
-const CURSOR_BETA = 0.012
+// Raised from 0.012: a fast swing trailed far enough behind the hand that
+// throwing a blade felt like dragging it through syrup. Rest steadiness comes
+// from MIN_CUTOFF, which is unchanged.
+const CURSOR_BETA = 0.025
 const SKELETON_MIN_CUTOFF = 2.4
 const SKELETON_BETA = 0.02
 
@@ -118,8 +121,23 @@ const SKELETON_BETA = 0.02
  * Two thresholds, not one: it takes a tighter pinch to start a press than to
  * keep one, so the press cannot flicker on the boundary.
  */
-const PINCH_ON = 0.40
-const PINCH_OFF = 0.60
+/**
+ * Measured in 3D (see `pinchGap`), where touching fingertips sit around 0.12-0.18
+ * of a hand span apart. 0.40 used to be the press threshold, and in flat 2D at
+ * that — three or four centimetres of daylight between thumb and finger, or a
+ * hand merely turned so the two overlapped from the camera's angle, and it
+ * grabbed. Now the fingers have to actually meet to grab. Letting go stays
+ * deliberately loose, so a grab is not dropped by fingers relaxing mid-throw.
+ */
+// 0.22 proved too strict in use: a firm pinch that the camera saw slightly
+// apart did not register. 0.30 still needs the fingers essentially together
+// (half-closed sits around 0.4+), and the hold stays loose so a grab survives
+// fingers relaxing mid-drag.
+const PINCH_ON = 0.30
+const PINCH_OFF = 0.52
+/** Smoothing on the gap, 0..1 (higher = more responsive). Raw depth is the
+ *  noisiest thing MediaPipe reports; this keeps it from flickering a press. */
+const GAP_SMOOTHING = 0.5
 
 /** A finger counts as extended when its tip is this much further from the
  *  wrist than its middle joint. Ratio rather than a y-comparison, so it still
@@ -324,6 +342,8 @@ const filters = new Map<number, Filters>()
 
 /** Recent cursor positions per hand, so a press can aim from before the pinch. */
 const trails = new Map<number, { x: number; y: number; at: number }[]>()
+/** Smoothed thumb-to-index gap per hand, as a fraction of hand span. */
+const gaps = new Map<number, number>()
 /** When the fingers first closed, per hand — see PINCH_CONFIRM_MS. */
 const pinchSince = new Map<number, number>()
 /** When the finger pose last changed, per hand — see POSE_SETTLE_MS. */
@@ -493,6 +513,25 @@ const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
   Math.hypot(a.x - b.x, a.y - b.y)
 
 /**
+ * Thumb-to-index gap as a fraction of hand span, in three dimensions.
+ *
+ * Flat 2D distance is the camera's opinion, not the hand's: turn your hand a
+ * little and thumb and finger overlap on screen while still well apart in the
+ * air, which read as a pinch. MediaPipe reports depth for every landmark on
+ * roughly the same scale as x, so measure the real gap. Both lengths come from
+ * the same frame, so the ratio is still independent of distance from camera.
+ */
+function pinchGap(marks: { x: number; y: number; z?: number }[], w: number, h: number): number {
+  const d3 = (a: number, b: number) =>
+    Math.hypot(
+      (marks[a].x - marks[b].x) * w,
+      (marks[a].y - marks[b].y) * h,
+      ((marks[a].z ?? 0) - (marks[b].z ?? 0)) * w,
+    )
+  return d3(THUMB_TIP, INDEX_TIP) / (d3(WRIST, MIDDLE_MCP) || 1)
+}
+
+/**
  * Is this finger extended?
  *
  * Compared as distance from the wrist rather than by which landmark is higher
@@ -608,6 +647,7 @@ function dropHand(i: number) {
   trails.delete(i)
   pinchSince.delete(i)
   poseChangedAt.delete(i)
+  gaps.delete(i)
 }
 
 /**
@@ -691,7 +731,10 @@ function loop(mine: number) {
     )
 
     const span = dist(points[WRIST], points[MIDDLE_MCP]) || 1
-    const gap = dist(points[THUMB_TIP], points[INDEX_TIP]) / span
+    const rawGap = pinchGap(marks, w, h)
+    const prevGap = gaps.get(i)
+    const gap = prevGap === undefined ? rawGap : prevGap + (rawGap - prevGap) * GAP_SMOOTHING
+    gaps.set(i, gap)
 
     let hand = hands.find((q) => q.id === i)
     if (!hand) {

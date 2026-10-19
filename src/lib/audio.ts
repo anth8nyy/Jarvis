@@ -21,6 +21,20 @@ export async function getMic(): Promise<MediaStream> {
   return stream
 }
 
+/**
+ * Close the microphone completely — the stream, its tracks and the analyser —
+ * so the system's mic indicator goes out. Used by mute; getMic() and
+ * startAnalyser() open it again afterwards.
+ */
+export function releaseMic(): void {
+  stream?.getTracks().forEach((t) => t.stop())
+  stream = null
+  void ctx?.close().catch(() => {})
+  ctx = null
+  analyser = null
+  buf = null
+}
+
 export async function startAnalyser(): Promise<void> {
   if (analyser) return
   const s = await getMic()

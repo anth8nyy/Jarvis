@@ -3,6 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { useStore, accentFor, type Phase } from '../store'
 import { Suggestions } from './Suggestions'
 import { BladeSweep, Blades } from './Blades'
+import { AgendaBox } from './Agenda'
 import { Effects } from './Effects'
 import { Pointer } from './Pointer'
 import { GestureGuide } from './GestureGuide'
@@ -16,6 +17,33 @@ const statusText: Record<Phase, string> = {
   thinking: 'PROCESSING',
   tooling: 'ACCESSING SYSTEMS',
   speaking: 'RESPONDING',
+}
+
+function MicIcon({ off }: { off: boolean }) {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+      <rect x="9" y="2" width="6" height="12" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0M12 18v4" />
+      {off && <path d="M3 3l18 18" />}
+    </svg>
+  )
+}
+
+/**
+ * The SIGNAL meter, on its own. The level changes every frame; when the HUD
+ * itself read it, the entire interface re-rendered dozens of times a second to
+ * move one bar — the single biggest cost on the page. Now only this does.
+ */
+function SignalMeter() {
+  const level = useStore((s) => s.level)
+  return (
+    <>
+      <div className="meter">
+        <div className="meter-fill" style={{ height: `${level * 100}%` }} />
+      </div>
+      <div className="rail-item mono">{(level * 100).toFixed(0).padStart(3, '0')}%</div>
+    </>
+  )
 }
 
 function Corner({ at }: { at: 'tl' | 'tr' | 'bl' | 'br' }) {
@@ -153,11 +181,11 @@ export function Hud() {
   const activeTool = useStore((s) => s.activeTool)
   const connected = useStore((s) => s.connected)
   const error = useStore((s) => s.error)
-  const level = useStore((s) => s.level)
   const voice = useStore((s) => s.voice)
   const bootNote = useStore((s) => s.bootNote)
   const gestures = useStore((s) => s.gestures)
   const looking = useStore((s) => s.looking)
+  const muted = useStore((s) => s.muted)
   const ui = useStore((s) => s.ui)
 
   // accentFor folds JARVIS's overrides in over the phase colour, so one
@@ -196,8 +224,19 @@ export function Hud() {
         )}
 
         <div className="status">
+          <button
+            type="button"
+            className={`mute-btn${muted ? ' is-muted' : ''}`}
+            aria-pressed={muted}
+            title={muted ? 'Microphone off — click or press M to turn it on' : 'Mute the microphone (M)'}
+            onClick={() => useStore.getState().setMuted(!muted)}
+          >
+            <MicIcon off={muted} />
+            {muted ? 'MIC OFF' : 'MIC ON'}
+          </button>
           <span className="dot" />
           <span className="status-text">
+            {muted && phase !== 'offline' && phase !== 'boot' ? 'MUTED — ' : ''}
             {/* bootNote is the voice-model download readout. It is only ever
                 the right thing to show during boot — as a general fallback a
                 note that never got cleared (a stuck 'voice 97%') sits over
@@ -228,10 +267,24 @@ export function Hud() {
       {/* Right rail: live telemetry, mostly for flavour */}
       <aside className="rail rail-right">
         <div className="rail-title">SIGNAL</div>
-        <div className="meter">
-          <div className="meter-fill" style={{ height: `${level * 100}%` }} />
+        <SignalMeter />
+
+        {/* The keys, under everything else on the right — they used to run
+            along the bottom, where the typing line now opens. */}
+        <div className="rail-title rail-keys-title">KEYS</div>
+        <div className="rail-keys">
+          <div>say <b>“hey jarvis”</b></div>
+          <div><kbd>Space</kbd> talk</div>
+          <div><kbd>T</kbd> type</div>
+          <div><kbd>M</kbd> mute</div>
+          <div><kbd>G</kbd> hands</div>
+          <div><kbd>Esc</kbd> stand down</div>
+          {voice && (
+            <div>
+              <kbd>V</kbd> {voice.replace(/\(.*?\)/g, '').trim()}
+            </div>
+          )}
         </div>
-        <div className="rail-item mono">{(level * 100).toFixed(0).padStart(3, '0')}%</div>
       </aside>
 
       <AnimatePresence>
@@ -306,21 +359,13 @@ export function Hud() {
           system it documents stays findable. */}
       <Blades />
 
+      {/* Today's calendar and reminders, bottom-left, draggable. */}
+      <AgendaBox />
+
       {ui.chrome.suggestions && <Suggestions />}
 
       {error && <div className="error">{error}</div>}
 
-      <footer className="hud-bottom">
-        <span className="hint">
-          say <b>“hey jarvis”</b> · <kbd>Space</kbd> to talk · <kbd>G</kbd> hands
-          {voice && (
-            <>
-              {' · '}
-              <kbd>V</kbd> voice: {voice.replace(/\(.*?\)/g, '').trim()}
-            </>
-          )}
-        </span>
-      </footer>
 
       {/* Last, so a flash or a tear reads as being on the glass rather than
           underneath the chrome. It is pointer-events: none and unmounts the

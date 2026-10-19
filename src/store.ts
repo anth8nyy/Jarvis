@@ -39,7 +39,16 @@ export type Panel = {
 export type Blade = {
   id: string
   title: string
-  kind: 'article' | 'image' | 'gallery' | 'video' | 'embed' | 'markup' | 'camera'
+  kind: 'article' | 'image' | 'gallery' | 'video' | 'embed' | 'markup' | 'camera' | 'timer' | 'clock' | 'stopwatch'
+  /** timer: when it reaches zero (epoch ms), and how long it ran from. */
+  endsAt?: number
+  durationMs?: number
+  /** clock: an IANA time zone ("Asia/Tokyo"); absent means local time. */
+  timeZone?: string
+  /** stopwatch: when it started (epoch ms). */
+  startedAt?: number
+  /** timer: the bridge asking for it to be taken down. */
+  cancel?: boolean
   /** article / image / video / embed. */
   url?: string
   /** gallery. */
@@ -228,6 +237,13 @@ type State = {
   /** Set while JARVIS is taking a look, to whatever he said he was looking for.
    *  null when he is not. The camera light is on either way — this says why. */
   looking: string | null
+  /** Microphone muted from the HUD button or M: he hears nothing, not even
+   *  his name, until it is switched back on. */
+  muted: boolean
+  setMuted: (m: boolean) => void
+  /** The typing line is open (T). */
+  typing: boolean
+  setTyping: (t: boolean) => void
   /** Transient status line during boot, e.g. the voice model download. */
   bootNote: string
   /** Cards currently on the display, newest last. */
@@ -250,6 +266,8 @@ type State = {
   pushBlade: (b: Blade) => void
   closeBlade: (id: string) => void
   clearBlades: () => void
+  /** Right-click → Stay: keep this blade through the next question. */
+  setBladeHold: (id: string, hold: Blade['hold']) => void
   focusBlade: (id: string | null) => void
   expandBlade: (id: string | null) => void
   setPhase: (p: Phase) => void
@@ -272,6 +290,8 @@ type State = {
 
 export const useStore = create<State>((set) => ({
   phase: 'offline',
+  muted: false,
+  typing: false,
   level: 0,
   caption: '',
   turns: [],
@@ -334,6 +354,8 @@ export const useStore = create<State>((set) => ({
     })),
   // Same contract as panels: 'turn' blades go when the user speaks again,
   // 'sticky' ones stay until something replaces them.
+  setBladeHold: (id, hold) =>
+    set((s) => ({ blades: s.blades.map((b) => (b.id === id ? { ...b, hold } : b)) })),
   clearBlades: () =>
     set((s) => {
       const kept = s.blades.filter((b) => b.hold === 'sticky')
@@ -347,6 +369,8 @@ export const useStore = create<State>((set) => ({
   focusBlade: (focusedBlade) => set({ focusedBlade }),
   expandBlade: (expandedBlade) => set({ expandedBlade }),
   setPhase: (phase) => set({ phase }),
+  setMuted: (muted) => set({ muted }),
+  setTyping: (typing) => set({ typing }),
   setLevel: (level) => set({ level }),
   setCaption: (caption) => set({ caption }),
   setActiveTool: (activeTool) => set({ activeTool }),

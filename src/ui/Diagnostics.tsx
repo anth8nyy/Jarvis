@@ -64,7 +64,9 @@ export function Diagnostics() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA') return
-      if (e.key === 'd' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (useStore.getState().typing) return
+      // Physical key, so the Greek layout's "δ" works too.
+      if (e.code === 'KeyD' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault()
         setOpen((o) => !o)
       }

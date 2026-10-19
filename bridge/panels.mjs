@@ -212,6 +212,8 @@ ${DESIGN_SYSTEM}`
  * are the same string. A counter is simply unique.
  */
 let seq = 0
+/** Countdowns started from this server, id → label, so they can be cancelled by name. */
+const timers = new Map()
 
 // ---------------------------------------------------------------------------
 // Blades
@@ -374,8 +376,106 @@ export function displayServer(emit, emitBlade) {
           size: args.slot === 'wide' ? 'wide' : 'compact',
           hold: args.hold ?? 'turn',
         })
-        return { content: [{ type: 'text', text: 'On screen.' }] }
+        // Worded so there is nothing to parrot: the model used to read this
+        // back out loud ("…sir. Shown.").
+        return { content: [{ type: 'text', text: '(drawn — do not mention it; continue only if there is something new to say)' }] }
       }),
+
+      tool(
+        'countdown',
+        'Start a countdown timer: it opens as its own blade on the screen and ' +
+          'counts down live, stays through later questions, and alerts the user ' +
+          'when it reaches zero. Use for "set a countdown / timer for …", "remind ' +
+          'me in ten minutes on screen", cooking, study sessions. Give the total ' +
+          'time in seconds (5 minutes = 300).',
+        {
+          seconds: z.number().positive().max(7 * 24 * 3600).describe('Total length in seconds.'),
+          label: z.string().optional().describe('What it is for, e.g. "Pasta" or "Study". Short.'),
+        },
+        async ({ seconds, label }) => {
+          const id = `timer-${Date.now().toString(36)}-${(seq++).toString(36)}`
+          const name = String(label ?? '').trim()
+          timers.set(id, name)
+          emitBlade({
+            id,
+            title: name ? name.toUpperCase() : 'COUNTDOWN',
+            kind: 'timer',
+            endsAt: Date.now() + Math.round(seconds * 1000),
+            durationMs: Math.round(seconds * 1000),
+            size: 'compact',
+            hold: 'sticky',
+          })
+          return { content: [{ type: 'text', text: `Countdown running on screen: ${Math.round(seconds)} seconds${name ? ` (${name})` : ''}.` }] }
+        },
+      ),
+
+      tool(
+        'clock',
+        'Show a LIVE clock on its own blade — it keeps ticking, unlike a panel. ' +
+          'Use it whenever they ask the time or the date, here or in another ' +
+          'city. For another place pass its IANA time zone ("Asia/Tokyo", ' +
+          '"America/New_York"); omit for local time.',
+        {
+          time_zone: z.string().optional().describe('IANA time zone, e.g. "Europe/London". Omit for local.'),
+          label: z.string().optional().describe('Place name to show, e.g. "TOKYO". Omit for local.'),
+        },
+        async ({ time_zone, label }) => {
+          const tz = String(time_zone ?? '').trim()
+          if (tz) {
+            try {
+              new Intl.DateTimeFormat('en-GB', { timeZone: tz })
+            } catch {
+              return { content: [{ type: 'text', text: `Not shown: "${tz}" is not a known time zone.` }] }
+            }
+          }
+          const id = `clock-${tz || 'local'}`
+          emitBlade({
+            id,
+            title: String(label ?? '').trim().toUpperCase() || (tz ? tz.split('/').pop().replace(/_/g, ' ').toUpperCase() : 'LOCAL TIME'),
+            kind: 'clock',
+            timeZone: tz || undefined,
+            size: 'compact',
+            hold: 'turn',
+          })
+          return { content: [{ type: 'text', text: '(drawn — your spoken sentence was the answer; end the turn now)' }] }
+        },
+      ),
+
+      tool(
+        'stopwatch',
+        'Start a stopwatch on its own blade: it counts up live from zero and stays ' +
+          'until closed. Use for "start a stopwatch", "time how long this takes".',
+        { label: z.string().optional().describe('What it is timing. Short.') },
+        async ({ label }) => {
+          const id = `stopwatch-${Date.now().toString(36)}-${(seq++).toString(36)}`
+          const name = String(label ?? '').trim()
+          timers.set(id, name)
+          emitBlade({
+            id,
+            title: name ? name.toUpperCase() : 'STOPWATCH',
+            kind: 'stopwatch',
+            startedAt: Date.now(),
+            size: 'compact',
+            hold: 'sticky',
+          })
+          return { content: [{ type: 'text', text: `Stopwatch running${name ? ` (${name})` : ''}.` }] }
+        },
+      ),
+
+      tool(
+        'countdown_cancel',
+        'Stop and remove countdown timers and stopwatches — one by its label, or all of them.',
+        { label: z.string().optional().describe('Which one, by its label. Omit to cancel all.') },
+        async ({ label }) => {
+          const want = String(label ?? '').trim().toLowerCase()
+          const hit = [...timers].filter(([, name]) => !want || name.toLowerCase().includes(want))
+          for (const [id] of hit) {
+            timers.delete(id)
+            emitBlade({ id, title: '', kind: 'timer', size: 'compact', hold: 'turn', cancel: true })
+          }
+          return { content: [{ type: 'text', text: hit.length ? `Cancelled ${hit.length} countdown(s).` : 'No countdown matched.' }] }
+        },
+      ),
 
       tool('blade', BLADE_DESCRIPTION, bladeSchema, async (args) => {
         const kind = args.kind

@@ -1,3 +1,4 @@
+import { isGreek, onLang } from './lang'
 import {
   env,
   USE_ELEVENLABS,
@@ -46,12 +47,16 @@ type Speaker = {
 // ---------------------------------------------------------------------------
 
 let speaking = ''
-let recent = ''
-let recentUntil = 0
+/** Sentences that finished recently, each with when it stops counting. */
+let recent: { text: string; until: number }[] = []
 
-/** Recognition lags the speakers by a few hundred milliseconds, so a sentence
- *  keeps arriving at the microphone well after it has finished playing. */
-const ECHO_TAIL_MS = 1800
+/** Recognition lags the speakers by a few hundred milliseconds, and the browser
+ *  recogniser batches whole phrases before it reports them — so a sentence can
+ *  arrive at the microphone several seconds after it finished playing. Too
+ *  short a tail and the echo of an earlier sentence in the same answer reads
+ *  as the user talking, which interrupts him and sends his own words back as a
+ *  new question: the answer restarts from the top, again and again. */
+const ECHO_TAIL_MS = 6000
 
 /**
  * Why you cannot hear him.
@@ -118,8 +123,9 @@ function setSpeaking(text: string) {
     return
   }
   if (speaking) {
-    recent = speaking
-    recentUntil = Date.now() + ECHO_TAIL_MS
+    const now = Date.now()
+    recent = recent.filter((r) => r.until > now)
+    recent.push({ text: speaking, until: now + ECHO_TAIL_MS })
   }
   speaking = ''
 }
@@ -134,7 +140,8 @@ function setSpeaking(text: string) {
  * one lands. See `isEcho` in voice.ts.
  */
 export function speakingNow(): string {
-  const tail = Date.now() < recentUntil ? recent : ''
+  const now = Date.now()
+  const tail = recent.filter((r) => r.until > now).map((r) => r.text).join(' ')
   return `${speaking} ${tail}`.trim()
 }
 
@@ -210,6 +217,21 @@ const USABLE = 40
 
 /** Best-first list of usable voices — also what the voice picker cycles. */
 export function candidateVoices(): SpeechSynthesisVoice[] {
+  // Greek: every Greek voice installed, male first, then higher quality.
+  // macOS ships Melina; Nikos and the Enhanced/Premium versions are free
+  // downloads in System Settings → Accessibility → Read & Speak.
+  if (isGreek()) {
+    // JARVIS is a man: Nikos (a free download) beats Melina whatever quality
+    // either is installed at, then the higher-quality download wins.
+    const rank = (v: SpeechSynthesisVoice) =>
+      (/nikos|νίκος/i.test(v.name) ? 10 : 0) +
+      (/premium/i.test(v.name) ? 2 : /enhanced/i.test(v.name) ? 1 : 0) +
+      (v.localService ? 0.5 : 0)
+    return speechSynthesis
+      .getVoices()
+      .filter((v) => /^el/i.test(v.lang))
+      .sort((a, b) => rank(b) - rank(a))
+  }
   return speechSynthesis
     .getVoices()
     .filter((v) => /^en/i.test(v.lang))
@@ -229,14 +251,17 @@ function pickVoice(): SpeechSynthesisVoice | null {
   // Honour an explicit choice made with the voice picker. A saved name that no
   // longer resolves is dropped rather than left to resurrect itself silently
   // if that voice is ever reinstalled.
-  const saved = localStorage.getItem(VOICE_PREF_KEY)
+  const saved = localStorage.getItem(isGreek() ? `${VOICE_PREF_KEY}.el` : VOICE_PREF_KEY)
   if (saved) {
     const hit = all.find((v) => v.name === saved)
     if (hit) return (cachedVoice = hit)
-    localStorage.removeItem(VOICE_PREF_KEY)
+    localStorage.removeItem(isGreek() ? `${VOICE_PREF_KEY}.el` : VOICE_PREF_KEY)
   }
 
-  cachedVoice = candidateVoices()[0] ?? all.find((v) => /^en/i.test(v.lang)) ?? null
+  cachedVoice =
+    candidateVoices()[0] ??
+    all.find((v) => (isGreek() ? /^el/i : /^en/i).test(v.lang)) ??
+    null
   return cachedVoice
 }
 
@@ -259,10 +284,15 @@ export function cycleVoice(): string {
   const now = pickVoice()
   const i = list.findIndex((v) => v.name === now?.name)
   const next = list[(i + 1) % list.length]
-  localStorage.setItem(VOICE_PREF_KEY, next.name)
+  localStorage.setItem(isGreek() ? `${VOICE_PREF_KEY}.el` : VOICE_PREF_KEY, next.name)
   cachedVoice = next
   return next.name
 }
+
+// A language switch means a different voice: pick afresh.
+onLang(() => {
+  cachedVoice = undefined
+})
 
 // Voices load asynchronously in Chrome; the first call usually returns nothing.
 if (typeof speechSynthesis !== 'undefined') {
@@ -329,6 +359,7 @@ function shape(text: string): string {
   )
 }
 
+
 type Item = {
   text: string
   /** Generation starts one sentence ahead, not all at once. */
@@ -341,6 +372,13 @@ export function createSpeaker(): Speaker {
   let cancelled = false
   let outLevel = 0
   let pumping = false
+  /**
+   * Greek: finished sentences waiting while he is still speaking. Spoken as
+   * one utterance the moment he is free, so an answer comes out as the first
+   * sentence straight away and then the rest in one flowing piece — instead of
+   * a gap between every sentence, or silence until the whole answer is written.
+   */
+  let held = ''
 
   let currentAudio: HTMLAudioElement | null = null
   let nativeInFlight = false
@@ -406,7 +444,13 @@ export function createSpeaker(): Speaker {
     try {
       for (;;) {
         if (cancelled) break
-        const item = queue.shift()
+        let item = queue.shift()
+        if (!item && held.trim()) {
+          const next = held
+          held = ''
+          enqueue(next)
+          item = queue.shift()
+        }
         if (!item) break
 
         prime(item)
@@ -477,15 +521,19 @@ export function createSpeaker(): Speaker {
       const u = new SpeechSynthesisUtterance(text)
       const voice = pickVoice()
       if (voice) u.voice = voice
-      u.lang = voice?.lang ?? 'en-GB'
+      u.lang = voice?.lang ?? (isGreek() ? 'el-GR' : 'en-GB')
       // Deliberate, and deliberately invariant — the character's pace does not
       // change with stakes, and that steadiness is most of the effect. This
       // lands around 130 wpm, below the median for film dialogue.
-      u.rate = 0.92
+      // Greek at a natural conversational pace; the slow, measured delivery is
+      // the English butler's, and in Greek it only sounded laboured.
+      // 0.92 was a deliberately slow butler's pace; it read as laboured rather
+      // than measured, so both languages now speak at a natural rate.
+      u.rate = isGreek() ? 1.0 : 0.98
       // Mid-baritone, and *not* pushed lower for gravitas. The voice is
       // clarity-weighted rather than chest-weighted; dropping it further reads
       // as a film-trailer voiceover, which is the wrong character entirely.
-      u.pitch = 0.95
+      u.pitch = isGreek() ? 1 : 0.95
 
       // speechSynthesis exposes no amplitude, so drive the reactor from a
       // synthetic envelope. It only has to look like speech, not match it.
@@ -665,42 +713,45 @@ export function createSpeaker(): Speaker {
       if (cancelled) return
       buffer += delta
 
-      // Drain every complete sentence sitting in the buffer.
+      // Complete sentences start speaking at once if he is quiet, and otherwise
+      // gather into `held` to follow as one piece — so an answer flows instead
+      // of stopping between every sentence. See `held`. (Was Greek-only; in
+      // English the gaps sounded just as unnatural.)
+      let from = 0
       for (;;) {
-        const m = SENTENCE_END.exec(buffer)
+        const m = SENTENCE_END.exec(buffer.slice(from))
         if (!m) break
-        const cut = m.index + m[0].length
-        const candidate = buffer.slice(0, cut)
-        // "Mr. Stark" is not two sentences. Leave the text in the buffer and
-        // wait for a boundary that actually ends something.
-        if (ABBREVIATION.test(candidate.trimEnd())) {
-          const rest = buffer.slice(cut)
-          if (!SENTENCE_END.test(rest)) break
-          // Re-scan from after this false boundary by folding it forward.
-          const next = SENTENCE_END.exec(rest)!
-          const wider = cut + next.index + next[0].length
-          enqueue(buffer.slice(0, wider))
-          buffer = buffer.slice(wider)
+        const cut = from + m.index + m[0].length
+        // "Mr. Stark" is not two sentences: look past the abbreviation.
+        if (ABBREVIATION.test(buffer.slice(0, cut).trimEnd())) {
+          from = cut
           continue
         }
-        enqueue(candidate)
+        held += buffer.slice(0, cut)
         buffer = buffer.slice(cut)
+        from = 0
       }
-
-      // Unpunctuated prose would otherwise sit here silently until the answer
-      // ended, defeating the whole point of streaming.
-      if (buffer.length > MAX_UNSPOKEN) {
+      // A long run with no full stop would otherwise sit unspoken: cut it at a
+      // word boundary and let it start.
+      if (!held && buffer.length > MAX_UNSPOKEN) {
         const cut = buffer.lastIndexOf(' ', MAX_UNSPOKEN)
         if (cut > 40) {
-          enqueue(buffer.slice(0, cut))
+          held = buffer.slice(0, cut)
           buffer = buffer.slice(cut)
         }
       }
+      if (held.trim() && !pumping && !queue.length) {
+        const next = held
+        held = ''
+        enqueue(next)
+      }
     },
     async end() {
-      if (buffer.trim()) {
-        enqueue(buffer)
+      if (held.trim() || buffer.trim()) {
+        const rest = held + buffer
+        held = ''
         buffer = ''
+        if (rest.trim()) enqueue(rest)
       }
       if (cancelled) return
       if (!pumping && !queue.length) return
@@ -710,6 +761,7 @@ export function createSpeaker(): Speaker {
       if (cancelled) return
       cancelled = true
       buffer = ''
+      held = ''
       queue.length = 0
       // Keep the echo tail: the words already in the air still have to be
       // recognised and discarded, even though he has stopped adding to them.

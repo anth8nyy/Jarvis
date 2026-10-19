@@ -121,6 +121,34 @@ body::after {
   animation: pulse 1.8s ease-in-out infinite;
 }
 
+/* Microphone mute, beside the status light. The HUD is click-through, so the
+   button has to opt back in. */
+.mute-btn {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 8px;
+  padding: 5px 10px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 2px;
+  cursor: pointer;
+}
+.mute-btn:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.mute-btn.is-muted {
+  color: #ff5a5a;
+  border-color: #ff5a5a;
+  background: rgba(255, 90, 90, 0.12);
+  box-shadow: 0 0 14px rgba(255, 90, 90, 0.35);
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.35; transform: scale(0.75); }
@@ -1745,22 +1773,78 @@ kbd {
 
 .bl-grip {
   position: absolute;
-  right: 0;
-  bottom: 0;
+  /* The reach is far bigger than the mark: 44px of invisible grab area on each
+     corner, so a hand cursor (or a quick mouse) does not have to hit a hairline. */
+  width: 44px;
+  height: 44px;
+  touch-action: none;
+  z-index: 3;
+}
+.bl-grip::after {
+  content: '';
+  position: absolute;
   width: 18px;
   height: 18px;
-  cursor: nwse-resize;
-  /* Two hairlines, the usual visual shorthand for a resize corner. */
-  background:
-    linear-gradient(135deg, transparent 0 46%,
-      color-mix(in srgb, var(--accent) 60%, transparent) 46% 54%, transparent 54%),
-    linear-gradient(135deg, transparent 0 68%,
-      color-mix(in srgb, var(--accent) 40%, transparent) 68% 76%, transparent 76%);
   opacity: 0.55;
-  touch-action: none;
-  z-index: 2;
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  border-style: solid;
+  border-width: 0;
+  transition: opacity 0.15s, width 0.15s, height 0.15s;
 }
-.bl-grip:hover { opacity: 1 }
+.bl-grip:hover::after { opacity: 1; width: 24px; height: 24px }
+.bl-grip-tl { top: 0; left: 0; cursor: nwse-resize }
+.bl-grip-tr { top: 0; right: 0; cursor: nesw-resize }
+.bl-grip-bl { bottom: 0; left: 0; cursor: nesw-resize }
+.bl-grip-br { bottom: 0; right: 0; cursor: nwse-resize }
+.bl-grip-tl::after { top: 3px; left: 3px; border-top-width: 2px; border-left-width: 2px }
+.bl-grip-tr::after { top: 3px; right: 3px; border-top-width: 2px; border-right-width: 2px }
+.bl-grip-bl::after { bottom: 3px; left: 3px; border-bottom-width: 2px; border-left-width: 2px }
+.bl-grip-br::after { bottom: 3px; right: 3px; border-bottom-width: 2px; border-right-width: 2px }
+/* The header buttons sit inside the top-right reach; they win. */
+.bl-acts { position: relative; z-index: 4 }
+
+/* "Stays" marker in the header; click it to let the blade go again. */
+.bl-stay {
+  margin-left: 8px;
+  padding: 1px 6px;
+  font: inherit;
+  font-size: 8px;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  border-radius: 2px;
+  cursor: pointer;
+  position: relative;
+  z-index: 4;
+}
+
+/* Right-click menu on a blade. */
+.bl-menu {
+  position: fixed;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  min-width: 140px;
+  padding: 4px;
+  background: rgba(4, 12, 18, 0.97);
+  border: 1px solid color-mix(in srgb, var(--accent, #5fd8ff) 45%, transparent);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--accent, #5fd8ff) 25%, transparent);
+  font-family: inherit;
+}
+.bl-menu button {
+  padding: 7px 12px;
+  text-align: left;
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent, #5fd8ff);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.bl-menu button:hover { background: color-mix(in srgb, var(--accent, #5fd8ff) 16%, transparent) }
 
 /* A resized blade is sized inline, so the presets must not fight it. */
 .bl[style*="width"] { max-width: none; max-height: none }
@@ -1896,3 +1980,198 @@ kbd {
   transform: scaleX(-1);
   background: #000;
 }
+
+/* Countdown blade — one big readout and a draining bar. */
+.bl-timer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  height: 100%;
+  min-height: 150px;
+  padding: 22px 18px;
+}
+.bl-timer-time {
+  font-size: 56px;
+  font-weight: 300;
+  letter-spacing: 0.08em;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  text-shadow: 0 0 24px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+.bl-timer-bar {
+  width: 100%;
+  height: 4px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.bl-timer-fill {
+  height: 100%;
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent);
+  transition: width 0.25s linear;
+}
+.bl-timer.is-done .bl-timer-time {
+  color: #ffb347;
+  text-shadow: 0 0 28px rgba(255, 179, 71, 0.8);
+  animation: bl-timer-flash 0.9s ease-in-out infinite;
+}
+@keyframes bl-timer-flash {
+  0%, 100% { opacity: 1 }
+  50% { opacity: 0.35 }
+}
+.bl-timer.is-done { cursor: pointer }
+.bl-timer.is-acked .bl-timer-time { animation: none; opacity: 0.7 }
+.bl-timer-hint {
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  opacity: 0.6;
+}
+
+/* Live clock and stopwatch — share the countdown's readout. */
+.bl-clock .bl-timer-time { font-size: 50px }
+.bl-clock-date {
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  opacity: 0.7;
+  text-align: center;
+}
+.bl-stopwatch-tenths { font-size: 0.5em; opacity: 0.7 }
+
+/* The typing line (T) — one more line of the conversation, right under it:
+   same column, same "YOU" label, the text visible as it is typed. */
+.typeline {
+  position: fixed;
+  left: 50%;
+  bottom: 92px;
+  transform: translateX(-50%);
+  width: min(760px, 68vw);
+  z-index: 30;
+  pointer-events: auto;
+}
+.typeline-field {
+  position: relative;
+  flex: 1;
+  min-height: 22px;
+}
+/* The visible text, and a small white cursor drawn after it. */
+.typeline-mirror {
+  display: block;
+  font-size: 14px;
+  line-height: 1.55;
+  letter-spacing: 0.01em;
+  color: #eaf9ff;
+  white-space: pre-wrap;
+  word-break: break-word;
+  pointer-events: none;
+}
+.typeline-caret {
+  display: inline-block;
+  width: 1.5px;
+  height: 0.85em;
+  margin-left: 1px;
+  vertical-align: -0.08em;
+  background: #fff;
+  animation: typeline-blink 1.05s steps(1) infinite;
+}
+@keyframes typeline-blink {
+  0%, 55% { opacity: 1 }
+  56%, 100% { opacity: 0 }
+}
+/* The real input: on top, catching keys, but itself invisible — no line, no
+   native caret, no text of its own. */
+.typeline-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  padding: 0;
+  font: inherit;
+  font-size: 14px;
+  color: transparent;
+  caret-color: transparent;
+  background: transparent;
+  border: 0;
+  outline: none;
+}
+
+/* Keys, in the right rail under the signal meter. */
+.rail-keys-title { margin-top: 22px }
+.rail-keys {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+.rail-keys kbd { margin-right: 6px }
+
+/* Today — the day's calendar, under the J.A.R.V.I.S. name (lined up with
+   it), draggable by its title bar. */
+.agenda {
+  position: absolute;
+  left: 92px;
+  top: 104px;
+  width: 270px;
+  max-height: 32vh;
+  display: flex;
+  flex-direction: column;
+  z-index: 8;
+  pointer-events: auto;
+  background: linear-gradient(160deg,
+    color-mix(in srgb, var(--accent) 9%, rgba(4, 12, 18, 0.9)),
+    rgba(2, 8, 12, 0.92));
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  box-shadow: 0 0 22px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.agenda-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 12px;
+  font-size: 9px;
+  letter-spacing: 0.3em;
+  color: var(--accent);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+.agenda-head:active { cursor: grabbing }
+.agenda-date { font-size: 8px; letter-spacing: 0.16em; opacity: 0.6; text-transform: uppercase }
+.agenda-body {
+  overflow-y: auto;
+  padding: 6px 0 8px;
+}
+.agenda-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 5px 12px;
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: 0.01em;
+  color: #dff6ff;
+}
+.agenda-time {
+  flex: 0 0 52px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--accent);
+  opacity: 0.8;
+}
+.agenda-title { display: flex; flex-direction: column; gap: 2px; line-height: 1.35 }
+.agenda-sub { font-size: 10px; opacity: 0.5 }
+.agenda-row.is-past { opacity: 0.35 }
+.agenda-row.is-next {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.agenda-rem .agenda-title { opacity: 0.85 }
+.agenda-row.is-overdue .agenda-time { color: #ffb347; opacity: 1 }
+.agenda-empty { padding: 8px 12px; font-size: 11px; opacity: 0.55; text-transform: none }

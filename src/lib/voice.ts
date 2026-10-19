@@ -1,6 +1,8 @@
 import { BRIDGE_HTTP_URL } from '../config'
 import { getMic } from './audio'
 import { speakingNow, speakingSince } from './tts'
+import { onLang, speechLang } from './lang'
+import { afterName, hasName } from './wake'
 import { startVad, type Vad } from './vad'
 import { caps } from './capabilities'
 
@@ -53,6 +55,13 @@ export type VoiceHandlers = {
 
 export type Voice = {
   stop: () => void
+  /**
+   * Drop everything heard so far and start listening afresh. Called when he
+   * finishes an answer, so nothing from before — the tail of his own speech
+   * still arriving from the recogniser, or a held half-sentence — can be glued
+   * onto the front of the next question.
+   */
+  flush: () => void
   /** True while a recogniser is actually running. */
   live: () => boolean
 }
@@ -64,30 +73,11 @@ export type Voice = {
 /** One utterance often produces several partials containing his name. */
 const WAKE_DEBOUNCE = 1500
 
-/**
- * His name, and the only wake phrase.
- *
- * The optional prefix is genuinely optional: addressing him by name alone is
- * correct, and during an answer "Jarvis" on its own is the natural way to cut
- * in. The negative lookahead keeps possessives ("Jarvis's job") from waking him.
- *
- * The alternates are not padding. "Jarvis" is not in a general dictation
- * model's high-frequency vocabulary, and Chrome routinely returns Travis,
- * Jervis, Jarvys or Java's for a perfectly clear utterance — every one of which
- * used to be silently discarded, so the wake word "just didn't work" with no
- * indication why. Better a rare false wake than a name that does not answer.
- */
-const WAKE =
-  /\b(?:hey|hi|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
+/** His name is matched by sound, in either language — see ./wake.ts. */
 
 /** Everything after the wake phrase, which is usually the actual command. */
 function afterWake(text: string): string {
-  const m = WAKE.exec(text)
-  if (!m) return ''
-  return text
-    .slice(m.index + m[0].length)
-    .replace(/^[\s,.:;!?-]+/, '')
-    .trim()
+  return afterName(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +247,15 @@ function makeAssembler(h: {
 const norm = (s: string) =>
   s
     .toLowerCase()
-    .replace(/[^a-z0-9' ]+/g, ' ')
+    // "p.m." / "p m" / "pm" all come out of one spoken time depending on who
+    // wrote it — the model or the recogniser. Fold them so a time he reads out
+    // still matches its own echo.
+    .replace(/\b([ap])\.?\s?m\b\.?/g, '$1m')
+    .normalize('NFD')
+    .replace(/\p{M}+/gu, '')
+    // Any letter in any script — matching only a-z erased Greek entirely, and
+    // an empty phrase reads as an echo, so every Greek sentence was dropped.
+    .replace(/[^\p{L}\p{N}' ]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 
@@ -267,7 +265,7 @@ const norm = (s: string) =>
  * would be the single most infuriating failure this file could have.
  */
 const OVERRIDE =
-  /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no)\b/i
+  /(?<![\p{L}\p{N}])(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no|σταμάτα|σταματα|περίμενε|περιμενε|τζάρβις|τζαρβις|φτάνει|φτανει|σκάσε|σκασε|άσ' το|ασ' το|άστο|αστο|ακύρωσε|ακυρωσε|όχι|οχι)(?![\p{L}\p{N}])/iu
 
 /**
  * Words too common to be evidence of anything.
@@ -369,6 +367,19 @@ function drop(why: string) {
   diag.dropped = why
 }
 
+/** Where a missed wake phrase is reported (the bridge log), set by the app. */
+let missReporter: ((text: string) => void) | null = null
+export function onWakeMiss(f: (text: string) => void): void {
+  missReporter = f
+}
+function reportMiss(text: string): void {
+  try {
+    missReporter?.(text)
+  } catch {
+    /* diagnostics only */
+  }
+}
+
 if (typeof window !== 'undefined') {
   ;(window as unknown as Record<string, unknown>).__voice = diag
 }
@@ -396,7 +407,7 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
         ? 'Microphone access denied — voice input is unavailable.'
         : 'No microphone available.',
     )
-    return { stop: () => {}, live: () => false }
+    return { stop: () => {}, flush: () => {}, live: () => false }
   }
   diag.engine = caps().stt ? 'elevenlabs' : 'browser'
   return caps().stt ? startElevenVoice(h) : startBrowserVoice(h)
@@ -482,7 +493,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       diag.heardAt = Date.now()
 
       if (mode === 'wake') {
-        if (WAKE.test(said) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+        if (hasName(said) && Date.now() - lastWake > WAKE_DEBOUNCE) {
           lastWake = Date.now()
           diag.wakes++
           diag.dropped = ''
@@ -581,6 +592,9 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       vad?.stop()
       diag.running = false
     },
+    flush: () => {
+      assemble.cancel()
+    },
     live: () => vad?.live() ?? false,
   }
 }
@@ -604,7 +618,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition
   if (!Ctor) {
     h.onError('This browser has no speech recognition — use Chrome or Edge, or add an ElevenLabs key.')
-    return { stop: () => {}, live: () => false }
+    return { stop: () => {}, flush: () => {}, live: () => false }
   }
 
   let stopped = false
@@ -615,6 +629,8 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
   let started = false
   let barged = false
   let lastWake = 0
+  /** The latest phrase on its own — see the wake check in onResult. */
+  let lastChunk = ''
   let lastAlive = Date.now()
   let silenceTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -659,14 +675,21 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     diag.heardAt = Date.now()
     if (mode === 'wake') {
       assemble.cancel()
-      if (WAKE.test(text) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+      const recent = lastChunk
+      lastChunk = ''
+      const where = hasName(recent) ? recent : hasName(text) ? text : ''
+      if (where && Date.now() - lastWake > WAKE_DEBOUNCE) {
         lastWake = Date.now()
         diag.wakes++
         diag.dropped = ''
         diag.accepted++
-        h.onWake(afterWake(text))
+        h.onWake(afterWake(where))
       } else {
         drop(`heard "${text.slice(-40)}" — not his name`)
+        // Short phrases are likely attempts at his name: note them so a
+        // spelling the matcher misses can be found and added.
+        const last = recent || text
+        if (last.split(/\s+/).length <= 6) reportMiss(last)
       }
       return
     }
@@ -707,10 +730,17 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
 
     if (mode === 'wake') {
       settled += fresh
-      if (WAKE.test(heard) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+      // The phrase being said right now, on its own. `heard` also carries
+      // everything the room said before it (up to 400 characters), and his name
+      // is matched by sound only near the start of a phrase — so checking only
+      // the long run missed "Τζάρβις" whenever anything had been said first.
+      const chunk = `${fresh} ${interim}`.replace(/\s+/g, ' ').trim()
+      lastChunk = chunk || lastChunk
+      const where = hasName(chunk) ? chunk : hasName(heard) ? heard : ''
+      if (where && Date.now() - lastWake > WAKE_DEBOUNCE) {
         lastWake = Date.now()
         diag.wakes++
-        const trailing = afterWake(heard)
+        const trailing = afterWake(where)
         reset()
         h.onWake(trailing)
       } else if (settled.length > 400) {
@@ -722,26 +752,25 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     settled += fresh
     const full = `${settled} ${interim}`.replace(/\s+/g, ' ').trim()
     if (!started || (mode === 'guard' && !barged)) {
-      const words = full.split(/\s+/).filter(Boolean).length
       if (mode === 'guard') {
-        // An override word cuts through everything below it — "stop" has to
-        // work on the first syllable or it is not a stop button.
-        if (!OVERRIDE.test(full)) {
-          // His own first syllable, same as the premium path. This engine has
-          // no energy gate, so without the clock the only defence is the word
-          // count below, and a single clear word is exactly what leaks first.
-          const since = speakingSince()
-          if (since && Date.now() - since < SELF_GUARD_MS) {
-            diag.selfGuarded++
-            return
-          }
-          // Two words before this engine believes an interruption. The energy
-          // path can be instant because it triggers on loudness the canceller
-          // has already had a pass at; here the evidence is a transcript of
-          // audio that includes his own playback, and one word of that is not
-          // evidence of anything.
-          if (words < 2) return
+        // On this path the microphone hears his playback with nothing but the
+        // browser's echo canceller in between, and the recogniser transcribes
+        // it faithfully enough to pass for speech. Letting any two words
+        // interrupt him meant his own answer kept cutting itself off and coming
+        // back as a fresh question. So here only a deliberate word — "stop",
+        // "wait", his name — interrupts, and not one he is saying himself; the
+        // energy path keeps the free-form barge-in, because its detector sees
+        // through the canceller. Whatever else was heard is his echo: drop it
+        // so it cannot pile up and ride along with the next real request.
+        const word = full.match(OVERRIDE)?.[0]
+        if (!word || norm(speakingNow()).split(' ').includes(norm(word))) {
+          settled = ''
+          interim = ''
+          return
         }
+        // Keep only what came from the stop word on.
+        settled = full.slice(full.search(OVERRIDE))
+        interim = ''
       }
       started = true
       if (mode === 'guard') barged = true
@@ -760,7 +789,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     rec = new Ctor()
     rec.continuous = true
     rec.interimResults = true
-    rec.lang = 'en-GB'
+    rec.lang = speechLang()
     rec.onstart = () => {
       running = true
       diag.running = true
@@ -813,9 +842,34 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     spin()
   }, 5000)
 
+  // Switching between English and Greek: stop the recogniser, and the restart
+  // in onend brings it back listening in the new language.
+  const offLang = onLang(() => {
+    reset()
+    assemble.cancel()
+    try {
+      rec?.abort()
+    } catch {
+      /* already gone */
+    }
+  })
+
   return {
+    flush: () => {
+      // A fresh recogniser session: Chrome keeps delivering results from the
+      // session that heard him speak, well after he has stopped. Aborting
+      // ends it, and onend starts a clean one straight away.
+      reset()
+      assemble.cancel()
+      try {
+        rec?.abort()
+      } catch {
+        /* already gone */
+      }
+    },
     stop: () => {
       stopped = true
+      offLang()
       clearInterval(health)
       clearSilence()
       assemble.cancel()
